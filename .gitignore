@@ -40,6 +40,10 @@ compile_commands.json
 Thumbs.db
 
 # Large local media samples
+/Project_Guid/
+/photo_2026-06-15_23-13-10.jpg
+/出山-花粥 王胜娚.lrc
+/萝莉体 第二版/
 *.mp4
 *.mkv
 *.mov
