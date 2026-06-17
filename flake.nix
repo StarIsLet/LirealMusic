@@ -6,7 +6,7 @@
   description = "Lireal Music - cute C++20 audio visual MV generator";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
   };
 
   outputs = { self, nixpkgs }:
