@@ -1,0 +1,301 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Lireal Music - C++ audio visual rendering engine.
+# Copyright (C) 2026 Lireal contributors
+
+name: 可爱 Release 构建
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release 版本号，例如 v0.1.0'
+        required: false
+        default: 'nightly'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cute-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: 工作流与 Flake 轻量检查
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 actionlint
+        run: |
+          set -euo pipefail
+          version="1.7.7"
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz" -o actionlint.tar.gz
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+
+      - name: 检查 GitHub Actions
+        run: actionlint .github/workflows/*.yml
+
+      - name: 安装 Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: 检查 Flake 输出
+        run: nix flake show --all-systems
+
+  build-kubuntu:
+    name: Kubuntu / Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    needs: lint
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Kubuntu 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev \
+            libopencv-dev \
+            ffmpeg \
+            libavformat-dev \
+            libavcodec-dev \
+            libavutil-dev \
+            libswresample-dev \
+            libswscale-dev \
+            libfftw3-dev \
+            libomp-dev \
+            patchelf
+
+      - name: 配置 CMake
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIREAL_ENABLE_ONNXRUNTIME=OFF
+
+      - name: 编译
+        run: cmake --build build --parallel
+
+      - name: 打包 Kubuntu 产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+          elif [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="nightly-${GITHUB_SHA::7}"
+          fi
+          version="${version//\//-}"
+          package="LirealMusic-${version}-kubuntu-x86_64"
+          mkdir -p "dist/${package}/bin" "dist/${package}/assets/themes" "dist/${package}/licenses"
+          cp build/lireal build/lireal_tui "dist/${package}/bin/"
+          cp LICENSE README.md "dist/${package}/"
+          cp assets/themes/sakura.qss "dist/${package}/assets/themes/"
+          if [[ -f "萝莉体 第二版/loli.ttf" ]]; then
+            mkdir -p "dist/${package}/萝莉体 第二版"
+            cp "萝莉体 第二版/loli.ttf" "dist/${package}/萝莉体 第二版/"
+          fi
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd "$(dirname "$0")"' 'exec ./bin/lireal "$@"' > "dist/${package}/run-lireal.sh"
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd "$(dirname "$0")"' 'exec ./bin/lireal_tui "$@"' > "dist/${package}/run-lireal-tui.sh"
+          chmod +x "dist/${package}/run-lireal.sh" "dist/${package}/run-lireal-tui.sh"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+
+      - name: 上传 Kubuntu artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LirealMusic-kubuntu-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-arch:
+    name: Arch Linux
+    runs-on: ubuntu-24.04
+    needs: lint
+    if: github.event_name != 'pull_request'
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: 安装基础工具
+        run: pacman -Syu --noconfirm git
+
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Arch 依赖
+        run: |
+          pacman -Syu --noconfirm \
+            base-devel \
+            cmake \
+            ninja \
+            pkgconf \
+            qt6-base \
+            opencv \
+            ffmpeg \
+            openmp \
+            patchelf \
+            tar \
+            gzip
+
+      - name: 配置 CMake
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLIREAL_ENABLE_ONNXRUNTIME=OFF
+
+      - name: 编译
+        run: cmake --build build --parallel
+
+      - name: 打包 Arch 产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+          elif [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="nightly-${GITHUB_SHA::7}"
+          fi
+          version="${version//\//-}"
+          package="LirealMusic-${version}-arch-x86_64"
+          mkdir -p "dist/${package}/bin" "dist/${package}/assets/themes"
+          cp build/lireal build/lireal_tui "dist/${package}/bin/"
+          cp LICENSE README.md "dist/${package}/"
+          cp assets/themes/sakura.qss "dist/${package}/assets/themes/"
+          if [[ -f "萝莉体 第二版/loli.ttf" ]]; then
+            mkdir -p "dist/${package}/萝莉体 第二版"
+            cp "萝莉体 第二版/loli.ttf" "dist/${package}/萝莉体 第二版/"
+          fi
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd "$(dirname "$0")"' 'exec ./bin/lireal "$@"' > "dist/${package}/run-lireal.sh"
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd "$(dirname "$0")"' 'exec ./bin/lireal_tui "$@"' > "dist/${package}/run-lireal-tui.sh"
+          chmod +x "dist/${package}/run-lireal.sh" "dist/${package}/run-lireal-tui.sh"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+
+      - name: 上传 Arch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LirealMusic-arch-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-nixos:
+    name: NixOS / Flake
+    runs-on: ubuntu-24.04
+    needs: lint
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Nix 缓存
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: 检查 flake
+        run: nix flake check --print-build-logs
+
+      - name: 构建 Nix 包
+        run: nix build .#lirealMusic --print-build-logs
+
+      - name: 打包 NixOS 产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+          elif [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="nightly-${GITHUB_SHA::7}"
+          fi
+          version="${version//\//-}"
+          package="LirealMusic-${version}-nixos-x86_64"
+          mkdir -p "dist/${package}"
+          cp -a result/* "dist/${package}/"
+          cp LICENSE README.md "dist/${package}/"
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd "$(dirname "$0")"' 'exec ./bin/lireal "$@"' > "dist/${package}/run-lireal.sh"
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'cd "$(dirname "$0")"' 'exec ./bin/lireal_tui "$@"' > "dist/${package}/run-lireal-tui.sh"
+          chmod +x "dist/${package}/run-lireal.sh" "dist/${package}/run-lireal-tui.sh"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+
+      - name: 上传 NixOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LirealMusic-nixos-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: 发布可爱 Release
+    needs:
+      - build-kubuntu
+      - build-arch
+      - build-nixos
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: 生成 Release 说明
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          prerelease="false"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+            prerelease="true"
+          elif [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            version="nightly-${GITHUB_SHA::7}"
+            prerelease="true"
+          fi
+          version="${version//\//-}"
+          {
+            echo "# 🌸 Lireal Music ${version}"
+            echo
+            echo "可爱 Release 已自动编译完成喵~"
+            echo
+            echo "## 包含平台"
+            echo
+            echo "- 💙 Kubuntu / Ubuntu 24.04 x86_64"
+            echo "- 🐧 Arch Linux x86_64"
+            echo "- ❄️ NixOS x86_64（Flake 构建）"
+            echo
+            echo "## 运行方式"
+            echo
+            echo "解压对应压缩包后："
+            echo
+            echo "- GUI：\`./run-lireal.sh\`"
+            echo "- TUI：\`./run-lireal-tui.sh\`"
+            echo
+            echo "## 运行依赖提示"
+            echo
+            echo "请确保系统安装 Qt6、OpenCV、FFmpeg 运行库；NixOS 推荐直接使用 flake 包。"
+            echo "WebGPU 已作为全局渲染配置启用，不可用时会自动兼容回退。"
+          } > release-notes.md
+          echo "release_version=${version}" >> "$GITHUB_ENV"
+          echo "release_prerelease=${prerelease}" >> "$GITHUB_ENV"
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.release_version }}
+          name: 🌸 Lireal Music ${{ env.release_version }}
+          body_path: release-notes.md
+          prerelease: ${{ env.release_prerelease }}
+          files: release-artifacts/*.tar.gz

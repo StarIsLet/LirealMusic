@@ -1,0 +1,1351 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ * Lireal Music - C++ audio visual rendering engine.
+ * Copyright (C) 2026 Lireal contributors
+ *
+ * This file is part of Lireal Music.
+ * Lireal Music is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+#include "lireal/render/video_renderer.hpp"
+
+#include "lireal/audio/audio_analyzer.hpp"
+#include "lireal/lyrics/lrc_parser.hpp"
+
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
+
+#include <QColor>
+#include <QFont>
+#include <QFontDatabase>
+#include <QImage>
+#include <QLinearGradient>
+#include <QPainter>
+#include <QPainterPath>
+#include <QString>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <initializer_list>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+
+#if LIREAL_HAS_OPENMP
+#include <omp.h>
+#endif
+
+namespace lireal::render {
+namespace {
+
+cv::Mat coverResize(const cv::Mat& source, int width, int height) {
+    const double scale = std::max(width / static_cast<double>(source.cols), height / static_cast<double>(source.rows));
+    cv::Mat resized;
+    cv::resize(source, resized, {}, scale, scale, cv::INTER_CUBIC);
+    const int x = std::max(0, (resized.cols - width) / 2);
+    const int y = std::max(0, (resized.rows - height) / 2);
+    return resized(cv::Rect(x, y, width, height)).clone();
+}
+
+cv::Mat makeCircularImage(const cv::Mat& source, int diameter) {
+    cv::Mat square = coverResize(source, diameter, diameter);
+    cv::Mat result(square.size(), square.type(), cv::Scalar(0, 0, 0));
+    cv::Mat mask(square.rows, square.cols, CV_8UC1, cv::Scalar(0));
+    cv::circle(mask, {diameter / 2, diameter / 2}, diameter / 2 - 4, cv::Scalar(255), cv::FILLED, cv::LINE_AA);
+    square.copyTo(result, mask);
+    return result;
+}
+
+void alphaBlend(cv::Mat& dst, const cv::Mat& src, cv::Point topLeft, double alpha) {
+    const cv::Rect dstRect(0, 0, dst.cols, dst.rows);
+    const cv::Rect srcRect(topLeft.x, topLeft.y, src.cols, src.rows);
+    const cv::Rect clipped = dstRect & srcRect;
+    if (clipped.empty()) {
+        return;
+    }
+
+    const cv::Rect sourceRoi(clipped.x - topLeft.x, clipped.y - topLeft.y, clipped.width, clipped.height);
+    cv::Mat dstPart = dst(clipped);
+    cv::Mat srcPart = src(sourceRoi);
+    cv::addWeighted(srcPart, alpha, dstPart, 1.0 - alpha, 0.0, dstPart);
+}
+
+void alphaBlendCircle(cv::Mat& dst, const cv::Mat& src, cv::Point topLeft, double alpha) {
+    const cv::Rect dstRect(0, 0, dst.cols, dst.rows);
+    const cv::Rect srcRect(topLeft.x, topLeft.y, src.cols, src.rows);
+    const cv::Rect clipped = dstRect & srcRect;
+    if (clipped.empty()) {
+        return;
+    }
+
+    const cv::Rect sourceRoi(clipped.x - topLeft.x, clipped.y - topLeft.y, clipped.width, clipped.height);
+    cv::Mat mask(src.rows, src.cols, CV_8UC1, cv::Scalar(0));
+    const int diameter = std::min(src.cols, src.rows);
+    cv::circle(mask, {src.cols / 2, src.rows / 2}, diameter / 2 - 3, cv::Scalar(255), cv::FILLED, cv::LINE_AA);
+    cv::GaussianBlur(mask, mask, {0, 0}, 1.4);
+
+    cv::Mat dstPart = dst(clipped);
+    cv::Mat srcPart = src(sourceRoi);
+    cv::Mat blended;
+    cv::addWeighted(srcPart, alpha, dstPart, 1.0 - alpha, 0.0, blended);
+    blended.copyTo(dstPart, mask(sourceRoi));
+}
+
+void drawSpectrumRing(cv::Mat& frame, const std::vector<float>& bins, cv::Point center, double radius, double barHeight, const cv::Scalar& color) {
+    if (bins.empty()) {
+        return;
+    }
+
+    static const std::array<double, 64> cosTable = []() {
+        std::array<double, 64> values{};
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const double angle = (2.0 * CV_PI * static_cast<double>(index) / static_cast<double>(values.size())) - CV_PI / 2.0;
+            values[index] = std::cos(angle);
+        }
+        return values;
+    }();
+    static const std::array<double, 64> sinTable = []() {
+        std::array<double, 64> values{};
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const double angle = (2.0 * CV_PI * static_cast<double>(index) / static_cast<double>(values.size())) - CV_PI / 2.0;
+            values[index] = std::sin(angle);
+        }
+        return values;
+    }();
+
+    for (std::size_t index = 0; index < bins.size(); ++index) {
+        const std::size_t tableIndex = index % cosTable.size();
+        const double level = std::clamp(static_cast<double>(bins[index]), 0.0, 1.0);
+        const double inner = radius;
+        const double outer = radius + 10.0 + barHeight * level;
+        const cv::Point p1(
+            center.x + static_cast<int>(cosTable[tableIndex] * inner),
+            center.y + static_cast<int>(sinTable[tableIndex] * inner));
+        const cv::Point p2(
+            center.x + static_cast<int>(cosTable[tableIndex] * outer),
+            center.y + static_cast<int>(sinTable[tableIndex] * outer));
+        const int thickness = 2 + static_cast<int>(level * 4.0);
+        cv::line(frame, p1, p2, color, thickness, cv::LINE_AA);
+    }
+}
+
+QFont makeLyricFont(int pixelSize, bool active, const std::string& requestedFamily = {});
+
+void loadBundledCuteFonts() {
+    static const bool loaded = []() {
+        const std::filesystem::path current = std::filesystem::current_path();
+        const std::initializer_list<std::filesystem::path> candidates = {
+            current / "loli.ttf",
+            current / "萝莉体 第二版" / "loli.ttf",
+            current / "assets" / "fonts" / "loli.ttf"
+        };
+        for (const auto& path : candidates) {
+            if (std::filesystem::exists(path)) {
+                QFontDatabase::addApplicationFont(QString::fromStdString(path.string()));
+            }
+        }
+        return true;
+    }();
+    (void)loaded;
+}
+
+cv::Scalar estimateLightAccentColor(const cv::Mat& background) {
+    cv::Scalar meanColor = cv::mean(background);
+    const double blue = std::clamp(meanColor[0] * 0.72 + 70.0, 150.0, 245.0);
+    const double green = std::clamp(meanColor[1] * 0.70 + 78.0, 160.0, 245.0);
+    const double red = std::clamp(meanColor[2] * 0.66 + 86.0, 170.0, 255.0);
+    return {blue, green, red};
+}
+
+void drawSoftSnow(cv::Mat& frame, double timeSeconds, const cv::Scalar& accent) {
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    constexpr int snowCount = 92;
+    for (int index = 0; index < snowCount; ++index) {
+        const double seed = static_cast<double>(index + 11) * 19.917;
+        const double rx = std::sin(seed) * 43758.5453;
+        const double ry = std::cos(seed * 1.37) * 24634.6345;
+        const double baseX = rx - std::floor(rx);
+        const double baseY = ry - std::floor(ry);
+        const double drift = std::fmod(baseY + timeSeconds * (0.018 + (index % 7) * 0.003), 1.0);
+        const int x = static_cast<int>(baseX * frame.cols + std::sin(timeSeconds * 0.42 + seed) * 24.0);
+        const int y = static_cast<int>(drift * frame.rows);
+        const int radius = 1 + (index % 3);
+        cv::circle(layer, {std::clamp(x, 0, frame.cols - 1), std::clamp(y, 0, frame.rows - 1)}, radius, accent, cv::FILLED, cv::LINE_AA);
+    }
+    cv::GaussianBlur(layer, layer, {0, 0}, 0.8);
+    cv::addWeighted(layer, 0.44, frame, 1.0, 0.0, frame);
+}
+
+void drawGlowingText(QPainter& painter, QString text, QPointF position, QFont font, const QColor& fill, const QColor& glow, qreal glowWidth) {
+    QPainterPath path;
+    path.addText(position, font, text);
+    painter.setPen(QPen(glow, glowWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(fill);
+    painter.drawPath(path);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(fill);
+    painter.drawPath(path);
+}
+
+void drawHighLightedCuteText(QPainter& painter, QString text, QPointF position, QFont font, const QColor& fill, const QColor& glow, double timeSeconds, qreal glowWidth) {
+    const QFontMetricsF metrics(font);
+    const qreal textWidth = metrics.horizontalAdvance(text);
+    const QRectF bounds(position.x() - textWidth * 0.05, position.y() - metrics.ascent() * 1.05, textWidth * 1.10, metrics.height() * 1.45);
+    const qreal pulse = 0.5 + 0.5 * std::sin(timeSeconds * 1.8);
+    const qreal sweep = std::fmod(timeSeconds * 0.34, 1.0);
+
+    painter.save();
+    painter.setOpacity(0.34 + pulse * 0.16);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(255, 255, 255, 72));
+    painter.drawRoundedRect(bounds, bounds.height() * 0.45, bounds.height() * 0.45);
+    painter.restore();
+
+    QPainterPath path;
+    path.addText(position, font, text);
+    painter.save();
+    painter.setPen(QPen(glow, glowWidth + pulse * 5.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(fill);
+    painter.drawPath(path);
+    painter.restore();
+
+    painter.save();
+    QLinearGradient gradient(position.x(), 0.0, position.x() + textWidth, 0.0);
+    gradient.setColorAt(0.0, fill);
+    gradient.setColorAt(std::clamp(sweep - 0.12, 0.0, 1.0), QColor(255, 255, 255));
+    gradient.setColorAt(std::clamp(sweep, 0.0, 1.0), QColor(180, 220, 255));
+    gradient.setColorAt(std::clamp(sweep + 0.12, 0.0, 1.0), fill);
+    gradient.setColorAt(1.0, fill);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(gradient);
+    painter.drawPath(path);
+    painter.restore();
+
+    painter.save();
+    painter.setOpacity(0.55 + pulse * 0.25);
+    painter.setPen(QPen(QColor(255, 255, 255, 210), std::max<qreal>(1.5, glowWidth * 0.20), Qt::SolidLine, Qt::RoundCap));
+    for (int star = 0; star < 4; ++star) {
+        const qreal sx = bounds.left() + bounds.width() * std::fmod(0.17 + star * 0.23 + timeSeconds * 0.035, 1.0);
+        const qreal sy = bounds.top() + bounds.height() * (0.20 + 0.18 * std::sin(timeSeconds * 1.2 + star));
+        const qreal r = 4.0 + pulse * 4.0 + star;
+        painter.drawLine(QPointF(sx - r, sy), QPointF(sx + r, sy));
+        painter.drawLine(QPointF(sx, sy - r), QPointF(sx, sy + r));
+    }
+    painter.restore();
+}
+
+void drawSongInfo(cv::Mat& frame, const RenderConfig& config, const cv::Scalar& accentColor, double timeSeconds) {
+    QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+    const QString title = QStringLiteral("《%1》").arg(QString::fromUtf8(config.songTitle.c_str()).trimmed().isEmpty() ? QStringLiteral("未命名") : QString::fromUtf8(config.songTitle.c_str()).trimmed());
+    const QString artist = QString::fromUtf8(config.artistName.c_str()).trimmed().isEmpty() ? QStringLiteral("未知作者") : QString::fromUtf8(config.artistName.c_str()).trimmed();
+    const QColor glow(static_cast<int>(accentColor[2]), static_cast<int>(accentColor[1]), static_cast<int>(accentColor[0]), 190);
+
+    QFont titleFont = makeLyricFont(std::max(32, frame.cols / 26), true, config.lyricFontFamily);
+    QFont artistFont = makeLyricFont(std::max(20, frame.cols / 66), false, config.lyricFontFamily);
+    const QFontMetricsF titleMetrics(titleFont);
+    const QFontMetricsF artistMetrics(artistFont);
+    const qreal minDim = std::min(frame.cols, frame.rows);
+    const qreal coverCenterX = frame.cols * 0.27;
+    const qreal coverCenterY = frame.rows * 0.57;
+    const qreal blackRingRadius = minDim * 0.176;
+    const qreal spectrumRadius = blackRingRadius + minDim * 0.022;
+    const qreal spectrumBarHeight = config.spectrumBarHeight * 0.58;
+    const qreal outerRingTop = coverCenterY - spectrumRadius - spectrumBarHeight - minDim * 0.030;
+    const qreal titleBlockGap = minDim * 0.024;
+    const qreal artistBaselineY = std::max(titleMetrics.height() + artistMetrics.height() + minDim * 0.020, outerRingTop - titleBlockGap);
+    const qreal titleY = artistBaselineY - artistMetrics.height() * 0.98;
+    const qreal titleX = coverCenterX - titleMetrics.horizontalAdvance(title) * 0.5;
+    painter.setOpacity(0.98);
+    drawHighLightedCuteText(painter, title, QPointF(titleX, titleY), titleFont, QColor(255, 255, 255), glow, timeSeconds, 6.8);
+    drawHighLightedCuteText(painter, artist, QPointF(coverCenterX - artistMetrics.horizontalAdvance(artist) * 0.5, artistBaselineY), artistFont, QColor(255, 255, 255, 240), QColor(150, 205, 255, 150), timeSeconds + 0.7, 3.4);
+    painter.end();
+}
+
+void drawWatermark(cv::Mat& frame, const RenderConfig& config) {
+    QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    const QString text = QString::fromUtf8(config.watermarkText.c_str()).trimmed().isEmpty() ? QStringLiteral("Lireal Music") : QString::fromUtf8(config.watermarkText.c_str()).trimmed();
+    QFont font = makeLyricFont(std::max(16, frame.cols / 78), false, config.lyricFontFamily);
+    const QFontMetricsF metrics(font);
+    painter.setFont(font);
+    painter.setPen(QColor(255, 255, 255, 170));
+    painter.drawText(QPointF(frame.cols - metrics.horizontalAdvance(text) - frame.cols * 0.045, frame.rows * 0.06), text);
+    painter.end();
+}
+
+const lyrics::LyricLine* activeLyric(const std::vector<lyrics::LyricLine>& lines, double timeSeconds) {
+    for (const auto& line : lines) {
+        if (timeSeconds >= line.startSeconds && timeSeconds < line.endSeconds) {
+            return &line;
+        }
+    }
+    return nullptr;
+}
+
+QFont makeLyricFont(int pixelSize, bool active, const std::string& requestedFamily) {
+    loadBundledCuteFonts();
+    static const QString fallbackFamily = []() {
+        const QStringList preferredFamilies = {
+            QStringLiteral("萝莉体"),
+            QStringLiteral("汉仪萝莉体简"),
+            QStringLiteral("HYLiLiangHeiJ"),
+            QStringLiteral("Aa萝莉体"),
+            QStringLiteral("AaLoli"),
+            QStringLiteral("Lolita"),
+            QStringLiteral("loli"),
+            QStringLiteral("LXGW WenKai"),
+            QStringLiteral("LXGW WenKai Screen"),
+            QStringLiteral("ZCOOL KuaiLe"),
+            QStringLiteral("ZCOOL QingKe HuangYou"),
+            QStringLiteral("Ma Shan Zheng"),
+            QStringLiteral("YouYuan"),
+            QStringLiteral("Noto Sans CJK SC"),
+            QStringLiteral("Noto Sans CJK JP"),
+            QStringLiteral("Source Han Sans SC"),
+            QStringLiteral("WenQuanYi Micro Hei"),
+            QStringLiteral("Microsoft YaHei"),
+            QStringLiteral("Sans Serif")
+        };
+        const QStringList installedFamilies = QFontDatabase::families();
+        for (const QString& family : preferredFamilies) {
+            if (installedFamilies.contains(family)) {
+                return family;
+            }
+        }
+        return QStringLiteral("Sans Serif");
+    }();
+
+    const QString requested = QString::fromUtf8(requestedFamily.c_str()).trimmed();
+    const QStringList installedFamilies = QFontDatabase::families();
+    const QString chosenFamily = (!requested.isEmpty() && installedFamilies.contains(requested)) ? requested : fallbackFamily;
+    QFont font(chosenFamily);
+    font.setPixelSize(pixelSize);
+    font.setWeight(active ? QFont::ExtraBold : QFont::DemiBold);
+    font.setStyleStrategy(static_cast<QFont::StyleStrategy>(QFont::PreferAntialias | QFont::PreferQuality));
+    font.setHintingPreference(QFont::PreferVerticalHinting);
+    return font;
+}
+
+void drawOutlinedText(QPainter& painter, const QString& text, QPointF position, const QFont& font, const QColor& fill, const QColor& outline, qreal outlineWidth) {
+    QPainterPath path;
+    path.addText(position, font, text);
+    painter.setPen(QPen(outline, outlineWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(fill);
+    painter.drawPath(path);
+}
+
+QFont fitLyricFont(QString& text, int preferredPixelSize, int minPixelSize, qreal maxWidth, bool active) {
+    QFont font = makeLyricFont(preferredPixelSize, active);
+    for (int pixelSize = preferredPixelSize; pixelSize >= minPixelSize; pixelSize -= 2) {
+        font.setPixelSize(pixelSize);
+        const QFontMetricsF metrics(font);
+        if (metrics.horizontalAdvance(text) <= maxWidth) {
+            return font;
+        }
+    }
+
+    font.setPixelSize(minPixelSize);
+    const QFontMetricsF metrics(font);
+    text = metrics.elidedText(text, Qt::ElideRight, maxWidth);
+    return font;
+}
+
+void drawCenteredOutlinedText(QPainter& painter, QString text, const QRectF& area, int preferredPixelSize, int minPixelSize, bool active, const QColor& fill, const QColor& outline, qreal outlineWidth) {
+    QFont font = fitLyricFont(text, preferredPixelSize, minPixelSize, area.width(), active);
+    const QFontMetricsF metrics(font);
+    const QPointF position(area.center().x() - metrics.horizontalAdvance(text) / 2.0, area.center().y() + metrics.ascent() / 2.0 - metrics.descent());
+    drawOutlinedText(painter, text, position, font, fill, outline, outlineWidth);
+}
+
+void drawAnimatedLyricText(
+    QPainter& painter,
+    QString text,
+    const QRectF& area,
+    int preferredPixelSize,
+    int minPixelSize,
+    bool active,
+    bool previousActive,
+    bool nextActive,
+    const QColor& fill,
+    const QColor& outline,
+    qreal outlineWidth,
+    double lineProgress,
+    double energy) {
+    QFont font = fitLyricFont(text, preferredPixelSize, minPixelSize, area.width(), active);
+    const QFontMetricsF metrics(font);
+    const qreal textWidth = metrics.horizontalAdvance(text);
+    const qreal baseline = area.center().y() + metrics.ascent() / 2.0 - metrics.descent();
+    const qreal entrance = active ? std::clamp(lineProgress / 0.22, 0.0, 1.0) : (nextActive ? 0.0 : 1.0);
+    const qreal exit = active ? std::clamp((1.0 - lineProgress) / 0.24, 0.0, 1.0) : (previousActive ? 0.0 : 1.0);
+    const qreal life = active ? std::min(entrance, exit) : (previousActive || nextActive ? 0.64 : 1.0);
+    const qreal pop = active ? std::sin(std::clamp(lineProgress / 0.28, 0.0, 1.0) * M_PI) : 0.0;
+    const qreal switchSlide = previousActive ? -area.width() * 0.11 : (nextActive ? area.width() * 0.11 : 0.0);
+    const qreal slide = active ? (1.0 - entrance) * area.width() * 0.16 - (1.0 - exit) * area.width() * 0.10 : switchSlide;
+    const qreal floatY = active ? std::sin(lineProgress * M_PI * 2.0) * (3.0 + energy * 7.0) - pop * area.height() * 0.14 : (previousActive ? -area.height() * 0.18 : (nextActive ? area.height() * 0.14 : 0.0));
+    painter.save();
+    painter.translate(area.center());
+    const qreal scale = active ? 0.94 + pop * 0.10 + energy * 0.018 : (previousActive || nextActive ? 0.94 : 1.0);
+    painter.scale(scale, scale);
+    const QPointF position(-textWidth / 2.0 + slide, baseline + floatY - area.center().y());
+
+    if (active) {
+        painter.save();
+        painter.setOpacity(std::clamp(0.14 + energy * 0.18, 0.12, 0.34) * life);
+        QPainterPath glowPath;
+        glowPath.addText(position, font, text);
+        painter.setPen(QPen(QColor(172, 211, 255, 130), outlineWidth + 12.0 + energy * 10.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawPath(glowPath);
+        painter.restore();
+    }
+
+    drawOutlinedText(painter, text, position, font, fill, outline, outlineWidth);
+
+    if (active) {
+        const qreal fillWidth = std::clamp(lineProgress, 0.0, 1.0) * textWidth;
+        painter.save();
+        painter.setClipRect(QRectF(position.x() - 8.0, position.y() - metrics.ascent() - 8.0, fillWidth + 16.0, metrics.height() + 18.0));
+        drawOutlinedText(painter, text, position, font, QColor(160, 210, 255), QColor(255, 255, 255, 180), outlineWidth * 0.52);
+        painter.restore();
+
+        painter.save();
+        const qreal sweepX = position.x() + fillWidth;
+        painter.setOpacity(std::clamp(0.22 + energy * 0.28, 0.18, 0.52) * life);
+        painter.setPen(QPen(QColor(255, 255, 255, 210), std::max<qreal>(2.0, outlineWidth * 0.42), Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(QPointF(sweepX, position.y() - metrics.ascent() * 0.78), QPointF(sweepX + 10.0, position.y() + metrics.descent() + 6.0));
+        painter.restore();
+    }
+    painter.restore();
+}
+
+int activeLyricIndex(const std::vector<lyrics::LyricLine>& lines, double timeSeconds) {
+    if (lines.empty()) {
+        return -1;
+    }
+
+    int nearest = 0;
+    for (int index = 0; index < static_cast<int>(lines.size()); ++index) {
+        const auto& line = lines[static_cast<std::size_t>(index)];
+        if (timeSeconds >= line.startSeconds && timeSeconds < line.endSeconds) {
+            return index;
+        }
+        if (line.startSeconds <= timeSeconds) {
+            nearest = index;
+        }
+    }
+    return nearest;
+}
+
+void applyMangaFilter(cv::Mat& frame, float intensity) {
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::Mat edges;
+    cv::Canny(gray, edges, 70, 150);
+    cv::Mat edgesBgr;
+    cv::cvtColor(edges, edgesBgr, cv::COLOR_GRAY2BGR);
+
+    cv::Mat mono;
+    cv::cvtColor(gray, mono, cv::COLOR_GRAY2BGR);
+    cv::addWeighted(frame, 1.0 - intensity, mono, intensity, 0.0, frame);
+    frame.setTo(cv::Scalar(12, 12, 16), edges);
+}
+
+void addImpactFlash(cv::Mat& frame, float bassEnergy) {
+    if (bassEnergy < 0.56F) {
+        return;
+    }
+    const double alpha = std::clamp((bassEnergy - 0.56F) * 1.15F, 0.0F, 0.38F);
+    cv::Mat flash(frame.size(), frame.type(), cv::Scalar(255, 238, 250));
+    cv::addWeighted(flash, alpha, frame, 1.0 - alpha, 0.0, frame);
+}
+
+void drawParticles(cv::Mat& frame, double timeSeconds, float energy) {
+    constexpr int particleCount = 128;
+    for (int index = 0; index < particleCount; ++index) {
+        const double seed = static_cast<double>(index + 1) * 12.9898;
+        const double rawX = std::sin(seed) * 43758.5453;
+        const double rawY = std::cos(seed * 1.71) * 24634.6345;
+        const double baseX = rawX - std::floor(rawX);
+        const double baseY = rawY - std::floor(rawY);
+        const double drift = std::fmod(timeSeconds * (0.035 + index % 7 * 0.006) + baseY, 1.0);
+        const int x = static_cast<int>(baseX * frame.cols + std::sin(timeSeconds * 1.4 + index) * 42.0 * energy);
+        const int y = static_cast<int>(drift * frame.rows);
+        const int size = 2 + (index % 5);
+        const cv::Scalar color = index % 3 == 0 ? cv::Scalar(255, 225, 245) : cv::Scalar(235, 235, 240);
+        cv::circle(frame, {std::clamp(x, 0, frame.cols - 1), std::clamp(y, 0, frame.rows - 1)}, size, color, cv::FILLED, cv::LINE_AA);
+    }
+}
+
+void drawAudioComets(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    const int cometCount = 18;
+    const cv::Point center(static_cast<int>(frame.cols * 0.50), static_cast<int>(frame.rows * 0.54));
+    for (int index = 0; index < cometCount; ++index) {
+        const double seed = static_cast<double>(index + 3) * 2.371;
+        const double level = energy.spectrumBins.empty() ? energy.rms : energy.spectrumBins[static_cast<std::size_t>((index * 7) % energy.spectrumBins.size())];
+        const double angle = timeSeconds * (0.55 + index * 0.012) + seed + energy.stereoWidth * 0.7;
+        const double orbit = (0.18 + 0.035 * index + level * 0.14) * std::min(frame.cols, frame.rows);
+        const cv::Point head(
+            center.x + static_cast<int>(std::cos(angle) * orbit * (1.15 + energy.stereoWidth * 0.30)),
+            center.y + static_cast<int>(std::sin(angle * 0.86) * orbit * (0.62 + energy.ambience * 0.18)));
+        const cv::Point tail(
+            head.x - static_cast<int>(std::cos(angle) * (32.0 + level * 110.0)),
+            head.y - static_cast<int>(std::sin(angle * 0.86) * (20.0 + level * 80.0)));
+        const cv::Scalar color(255, 190 + level * 55.0, 215 + energy.colorMood * 38.0);
+        cv::line(layer, tail, head, color, 1 + static_cast<int>(level * 4.0), cv::LINE_AA);
+        cv::circle(layer, head, 2 + static_cast<int>(level * 7.0), color, cv::FILLED, cv::LINE_AA);
+    }
+    cv::GaussianBlur(layer, layer, {0, 0}, 2.2 + energy.ambience * 2.8);
+    cv::addWeighted(layer, 0.34 + energy.beatPulse * 0.22, frame, 1.0, 0.0, frame);
+}
+
+cv::Point projectStemPoint(const audio::AudioStemEnergy& stem, const cv::Size& size, double orbitPhase) {
+    const double depth = std::clamp(static_cast<double>(stem.depth), 0.0, 1.0);
+    const double perspective = 1.18 - depth * 0.50;
+    const double width = 0.20 + static_cast<double>(stem.width) * 0.26;
+    const double x = size.width * (0.50 + stem.pan * width * perspective + std::sin(orbitPhase) * stem.width * 0.055 * perspective);
+    const double y = size.height * (0.63 - stem.height * 0.34 + depth * 0.22 + std::cos(orbitPhase) * stem.width * 0.040);
+    return {static_cast<int>(std::clamp(x, 0.0, static_cast<double>(size.width - 1))), static_cast<int>(std::clamp(y, 0.0, static_cast<double>(size.height - 1)))};
+}
+
+cv::Scalar stemColor(const audio::AudioStemEnergy& stem) {
+    if (stem.name.find("Vocal") != std::string::npos) {
+        return cv::Scalar(255, 190, 255);
+    }
+    if (stem.name.find("Harmony") != std::string::npos) {
+        return cv::Scalar(255, 220, 210);
+    }
+    if (stem.name.find("Bass") != std::string::npos) {
+        return cv::Scalar(220, 145, 255);
+    }
+    if (stem.name.find("Percussion") != std::string::npos) {
+        return cv::Scalar(255, 245, 190);
+    }
+    return cv::Scalar(255, 235, 245);
+}
+
+void drawSurroundStage(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
+    if (energy.stems.empty()) {
+        return;
+    }
+
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    const cv::Point stageCenter(static_cast<int>(frame.cols * 0.50), static_cast<int>(frame.rows * 0.64));
+    const int baseRadiusX = static_cast<int>(frame.cols * (0.27 + energy.stereoWidth * 0.17));
+    const int baseRadiusY = static_cast<int>(frame.rows * (0.095 + energy.ambience * 0.035));
+    for (int ring = 0; ring < 6; ++ring) {
+        const double scale = 0.74 + ring * 0.24 + energy.ambience * 0.18;
+        const double yOffset = (ring - 2.0) * frame.rows * 0.018;
+        const cv::Scalar color(205 + ring * 6, 155 + ring * 15, 255);
+        cv::ellipse(layer, {stageCenter.x, stageCenter.y + static_cast<int>(yOffset)}, {static_cast<int>(baseRadiusX * scale), static_cast<int>(baseRadiusY * scale)}, 0.0, 0.0, 360.0, color, 1 + ring / 2, cv::LINE_AA);
+    }
+
+    const int speakerY = static_cast<int>(frame.rows * 0.62);
+    const int speakerOffset = static_cast<int>(frame.cols * (0.34 + energy.stereoWidth * 0.10));
+    cv::line(layer, {stageCenter.x - speakerOffset, speakerY}, {stageCenter.x + speakerOffset, speakerY}, cv::Scalar(255, 230, 255), 1, cv::LINE_AA);
+    for (int side = -1; side <= 1; side += 2) {
+        const cv::Point speaker(stageCenter.x + side * speakerOffset, speakerY);
+        cv::circle(layer, speaker, static_cast<int>(22 + energy.stereoWidth * 36.0F), cv::Scalar(255, 245, 255), 2, cv::LINE_AA);
+        cv::line(layer, speaker, stageCenter, cv::Scalar(225, 195, 255), 1, cv::LINE_AA);
+    }
+
+    for (std::size_t index = 0; index < energy.stems.size(); ++index) {
+        const auto& stem = energy.stems[index];
+        const double phase = timeSeconds * (0.8 + index * 0.13) + static_cast<double>(index) * 1.73;
+        const cv::Point point = projectStemPoint(stem, frame.size(), phase);
+        const double nearScale = 1.22 - std::clamp(static_cast<double>(stem.depth), 0.0, 1.0) * 0.52;
+        const int radius = static_cast<int>((20.0 + stem.energy * 68.0) * nearScale);
+        const cv::Scalar color = stemColor(stem);
+        const cv::Point floorPoint(point.x, static_cast<int>(stageCenter.y + stem.depth * frame.rows * 0.12));
+        cv::line(layer, stageCenter, floorPoint, color, 1 + static_cast<int>(stem.presence * 3.0F), cv::LINE_AA);
+        cv::line(layer, floorPoint, point, color, 1 + static_cast<int>(stem.presence * 4.0F), cv::LINE_AA);
+        cv::ellipse(layer, floorPoint, {std::max(8, radius), std::max(3, radius / 4)}, 0.0, 0.0, 360.0, color, 1, cv::LINE_AA);
+        cv::circle(layer, point, radius + 20, color, 1, cv::LINE_AA);
+        cv::circle(layer, point, radius, color, cv::FILLED, cv::LINE_AA);
+        cv::circle(layer, point, std::max(4, radius / 3), cv::Scalar(255, 255, 255), cv::FILLED, cv::LINE_AA);
+        if (stem.width > 0.5F) {
+            cv::ellipse(layer, point, {static_cast<int>(radius * (1.0 + stem.width * 1.25F)), std::max(6, radius / 3)}, 0.0, 0.0, 360.0, color, 2, cv::LINE_AA);
+        }
+    }
+
+    cv::GaussianBlur(layer, layer, {0, 0}, 5.5 + energy.ambience * 7.0);
+    cv::addWeighted(layer, 0.42 + energy.rms * 0.20 + energy.stereoWidth * 0.10, frame, 1.0, 0.0, frame);
+}
+
+void addChromaticPrism(cv::Mat& frame, float intensity, float mood) {
+    if (intensity < 0.22F) {
+        return;
+    }
+    const int shift = std::clamp(static_cast<int>(1.0F + intensity * 5.0F + mood * 1.5F), 1, 6);
+
+    std::vector<cv::Mat> channels;
+    cv::split(frame, channels);
+    const cv::Mat redTransform = (cv::Mat_<double>(2, 3) << 1.0, 0.0, shift, 0.0, 1.0, -shift * 0.45);
+    const cv::Mat blueTransform = (cv::Mat_<double>(2, 3) << 1.0, 0.0, -shift, 0.0, 1.0, shift * 0.45);
+    cv::warpAffine(channels[2], channels[2], redTransform, frame.size(), cv::INTER_LINEAR, cv::BORDER_REFLECT101);
+    cv::warpAffine(channels[0], channels[0], blueTransform, frame.size(), cv::INTER_LINEAR, cv::BORDER_REFLECT101);
+    cv::merge(channels, frame);
+}
+
+void drawBeatShockwaves(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
+    if (energy.beatPulse < 0.18F && energy.dropIntensity < 0.22F) {
+        return;
+    }
+
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    const cv::Point center(static_cast<int>(frame.cols * 0.50), static_cast<int>(frame.rows * 0.56));
+    const float power = std::max(energy.beatPulse, energy.dropIntensity);
+    for (int ring = 0; ring < 5; ++ring) {
+        const double phase = std::fmod(timeSeconds * 2.2 + ring * 0.19, 1.0);
+        const int radius = static_cast<int>((0.10 + phase * 0.72) * std::min(frame.cols, frame.rows) * (0.62 + power * 0.22));
+        const int thickness = 1 + static_cast<int>(power * 5.0F * (1.0 - phase));
+        const cv::Scalar color(255, 185 + ring * 12, 235 + energy.colorMood * 20.0F);
+        cv::circle(layer, center, radius, color, std::max(1, thickness), cv::LINE_AA);
+    }
+    cv::GaussianBlur(layer, layer, {0, 0}, 2.0 + power * 3.0);
+    cv::addWeighted(layer, 0.22 + power * 0.34, frame, 1.0, 0.0, frame);
+}
+
+void drawStemLabels(cv::Mat& frame, const audio::AudioFrameEnergy& energy) {
+    if (energy.stems.empty()) {
+        return;
+    }
+
+    QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    const QFont font = makeLyricFont(std::max(18, frame.cols / 96), false);
+    painter.setFont(font);
+
+    for (std::size_t index = 0; index < energy.stems.size(); ++index) {
+        const auto& stem = energy.stems[index];
+        if (stem.energy < 0.16F) {
+            continue;
+        }
+        const cv::Point point = projectStemPoint(stem, frame.size(), static_cast<double>(index) * 1.73);
+        const QString label = QString::fromUtf8(stem.name.c_str());
+        painter.setOpacity(std::clamp(0.18 + stem.energy * 0.58, 0.0, 0.78));
+        drawOutlinedText(
+            painter,
+            label,
+            QPointF(point.x + 18.0, point.y - 14.0),
+            font,
+            QColor(255, 238, 252),
+            QColor(34, 20, 34, 190),
+            4.0);
+    }
+    painter.end();
+}
+
+void drawStarbursts(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
+    if (energy.treble < 0.10F && energy.vocal < 0.12F) {
+        return;
+    }
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    const int count = 10;
+    for (int index = 0; index < count; ++index) {
+        const double seed = static_cast<double>(index + 1) * 19.19;
+        const double rawX = std::sin(seed * 1.73) * 92821.37;
+        const double rawY = std::cos(seed * 2.11) * 71933.11;
+        const int x = static_cast<int>((rawX - std::floor(rawX)) * frame.cols);
+        const int y = static_cast<int>((rawY - std::floor(rawY)) * frame.rows * 0.78 + frame.rows * 0.06);
+        const double pulse = 0.5 + 0.5 * std::sin(timeSeconds * (2.4 + index * 0.11) + seed);
+        const int radius = static_cast<int>((8.0 + pulse * 22.0) * (0.35 + energy.treble * 0.72 + energy.vocal * 0.35));
+        const cv::Scalar color(255, 236, 255);
+        cv::line(layer, {x - radius, y}, {x + radius, y}, color, 1, cv::LINE_AA);
+        cv::line(layer, {x, y - radius}, {x, y + radius}, color, 1, cv::LINE_AA);
+        cv::line(layer, {x - radius / 2, y - radius / 2}, {x + radius / 2, y + radius / 2}, color, 1, cv::LINE_AA);
+        cv::line(layer, {x - radius / 2, y + radius / 2}, {x + radius / 2, y - radius / 2}, color, 1, cv::LINE_AA);
+    }
+    cv::GaussianBlur(layer, layer, {0, 0}, 1.5 + energy.treble * 2.5);
+    cv::addWeighted(layer, 0.28 + energy.treble * 0.38, frame, 1.0, 0.0, frame);
+}
+
+void drawDiagonalImpactText(cv::Mat& frame, const std::vector<lyrics::LyricLine>& lines, double timeSeconds, float energy) {
+    const auto* line = activeLyric(lines, timeSeconds);
+    if (line == nullptr || energy < 0.72F) {
+        return;
+    }
+
+    QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    painter.translate(frame.cols * 0.64, frame.rows * 0.16);
+    painter.rotate(-8.0 - energy * 3.0);
+    painter.setOpacity(std::clamp(0.06 + static_cast<double>(energy) * 0.16, 0.0, 0.26));
+
+    QFont font = makeLyricFont(static_cast<int>(52 + energy * 14.0F), true);
+    drawOutlinedText(
+        painter,
+        QString::fromUtf8(line->text.c_str()),
+        QPointF(0, 0),
+        font,
+        QColor(255, 255, 255),
+        QColor(45, 35, 45, 210),
+        10.0);
+    painter.end();
+}
+
+void drawLyrics(cv::Mat& frame, const std::vector<lyrics::LyricLine>& lines, double timeSeconds, float energy) {
+    if (lines.empty()) {
+        return;
+    }
+
+    QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+    const int index = activeLyricIndex(lines, timeSeconds);
+    if (index < 0) {
+        painter.end();
+        return;
+    }
+
+    const QRectF panel(frame.cols * 0.52, frame.rows * 0.10, frame.cols * 0.42, frame.rows * 0.80);
+    const qreal lineSpacing = panel.height() / 9.2;
+    const int visibleRadius = 5;
+    const auto& activeLine = lines[static_cast<std::size_t>(index)];
+    const double activeProgress = std::clamp((timeSeconds - activeLine.startSeconds) / std::max(0.12, activeLine.endSeconds - activeLine.startSeconds), 0.0, 1.0);
+    const double scrollT = std::clamp((activeProgress - 0.68) / 0.32, 0.0, 1.0);
+    const double smoothScroll = scrollT * scrollT * (3.0 - 2.0 * scrollT);
+    const auto drawSlot = [&](int lineIndex, int offset) {
+        if (lineIndex < 0 || lineIndex >= static_cast<int>(lines.size())) {
+            return;
+        }
+        const bool active = offset == 0;
+        const bool previousActive = offset == -1 && activeProgress < 0.26;
+        const bool nextActive = offset == 1 && activeProgress > 0.74;
+        const auto& lyric = lines[static_cast<std::size_t>(lineIndex)];
+        const double lineProgress = active ? std::clamp((timeSeconds - lyric.startSeconds) / std::max(0.12, lyric.endSeconds - lyric.startSeconds), 0.0, 1.0) : 0.5;
+        const qreal activeLift = active ? std::sin(lineProgress * M_PI) * lineSpacing * 0.10 : (previousActive ? lineSpacing * 0.16 : (nextActive ? -lineSpacing * 0.12 : 0.0));
+        const qreal centerY = panel.center().y() + (static_cast<qreal>(offset) - smoothScroll) * lineSpacing - activeLift;
+        if (centerY < panel.top() - lineSpacing || centerY > panel.bottom() + lineSpacing) {
+            return;
+        }
+        const qreal fade = std::clamp(1.0 - std::abs(offset) / static_cast<qreal>(visibleRadius + 1), 0.0, 1.0);
+        const qreal switchBoost = (previousActive || nextActive) ? 0.22 : 0.0;
+        const qreal opacity = active ? std::clamp(0.72 + std::sin(lineProgress * M_PI) * 0.28 + energy * 0.08, 0.0, 1.0) : std::clamp(fade * 0.62 + switchBoost, 0.0, 0.88);
+        const QString text = QString::fromUtf8(lyric.text.c_str());
+        const QRectF area(panel.left(), centerY - lineSpacing * 0.45, panel.width(), lineSpacing * 0.90);
+        painter.setOpacity(opacity);
+        drawAnimatedLyricText(
+            painter,
+            text,
+            area,
+            active ? static_cast<int>(54 + energy * 7.0F) : 42,
+            active ? 38 : 30,
+            active,
+            previousActive,
+            nextActive,
+            QColor(255, 255, 255),
+            QColor(20, 24, 30, active ? 178 : 132),
+            active ? 4.6 : 3.2,
+            lineProgress,
+            energy);
+    };
+
+    for (int offset = -visibleRadius; offset <= visibleRadius; ++offset) {
+        drawSlot(index + offset, offset);
+    }
+
+    painter.end();
+}
+
+void drawCenterLyric(cv::Mat& frame, const std::vector<lyrics::LyricLine>& lines, double timeSeconds, float energy) {
+    const auto* line = activeLyric(lines, timeSeconds);
+    if (line == nullptr) {
+        return;
+    }
+
+    QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+    const QString text = QString::fromUtf8(line->text.c_str());
+    const QFont font = makeLyricFont(static_cast<int>(68 + energy * 18.0F), true);
+    const QFontMetricsF metrics(font);
+    const QPointF position((frame.cols - metrics.horizontalAdvance(text)) / 2.0, frame.rows * 0.54);
+    painter.setOpacity(0.94);
+    drawOutlinedText(painter, text, position, font, QColor(255, 232, 248), QColor(44, 28, 42, 230), 10.0);
+    painter.end();
+}
+
+void drawKaraokeLyric(cv::Mat& frame, const std::vector<lyrics::LyricLine>& lines, double timeSeconds, float energy) {
+    const auto* line = activeLyric(lines, timeSeconds);
+    if (line == nullptr) {
+        return;
+    }
+
+    QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+    const QString text = QString::fromUtf8(line->text.c_str());
+    const QFont font = makeLyricFont(static_cast<int>(48 + energy * 8.0F), true);
+    const QFontMetricsF metrics(font);
+    const double x = (frame.cols - metrics.horizontalAdvance(text)) / 2.0;
+    const double y = frame.rows * 0.86;
+    const double progress = std::clamp((timeSeconds - line->startSeconds) / std::max(0.1, line->endSeconds - line->startSeconds), 0.0, 1.0);
+
+    painter.setOpacity(0.96);
+    drawOutlinedText(painter, text, QPointF(x, y), font, QColor(245, 245, 250), QColor(35, 24, 34, 220), 8.0);
+    painter.save();
+    painter.setClipRect(QRectF(x - 8.0, y - metrics.ascent() - 8.0, metrics.horizontalAdvance(text) * progress + 16.0, metrics.height() + 18.0));
+    drawOutlinedText(painter, text, QPointF(x, y), font, QColor(255, 176, 231), QColor(78, 22, 62, 220), 8.0);
+    painter.restore();
+    painter.end();
+}
+
+void drawLyricsByLayout(cv::Mat& frame, const std::vector<lyrics::LyricLine>& lines, double timeSeconds, float energy, int layoutMode) {
+    switch (layoutMode) {
+    case 1:
+        drawCenterLyric(frame, lines, timeSeconds, energy);
+        break;
+    case 2:
+        drawKaraokeLyric(frame, lines, timeSeconds, energy);
+        break;
+    default:
+        drawLyrics(frame, lines, timeSeconds, energy);
+        break;
+    }
+}
+
+void addBloom(cv::Mat& frame, double strength) {
+    cv::Mat blurred;
+    cv::GaussianBlur(frame, blurred, {0, 0}, 18.0);
+    cv::addWeighted(frame, 1.0, blurred, strength, 0.0, frame);
+}
+
+void applyDreamGrade(cv::Mat& frame, double timeSeconds, float energy) {
+    cv::Mat overlay(frame.size(), frame.type());
+    for (int y = 0; y < frame.rows; ++y) {
+        const double vertical = static_cast<double>(y) / static_cast<double>(std::max(1, frame.rows - 1));
+        const cv::Scalar color(
+            248.0 + 7.0 * std::sin(timeSeconds * 0.35),
+            214.0 + 18.0 * vertical,
+            255.0 - 28.0 * vertical);
+        overlay.row(y).setTo(color);
+    }
+    cv::addWeighted(overlay, 0.12 + energy * 0.045, frame, 0.88 - energy * 0.045, 0.0, frame);
+
+    cv::Mat vignette(frame.rows, frame.cols, CV_32F);
+    const double cx = frame.cols * 0.5;
+    const double cy = frame.rows * 0.52;
+    const double maxDistance = std::sqrt(cx * cx + cy * cy);
+    for (int y = 0; y < frame.rows; ++y) {
+        float* row = vignette.ptr<float>(y);
+        for (int x = 0; x < frame.cols; ++x) {
+            const double dx = static_cast<double>(x) - cx;
+            const double dy = static_cast<double>(y) - cy;
+            const double normalized = std::sqrt(dx * dx + dy * dy) / maxDistance;
+            row[x] = static_cast<float>(std::clamp(1.14 - normalized * 0.44, 0.72, 1.08));
+        }
+    }
+    std::vector<cv::Mat> channels;
+    cv::split(frame, channels);
+    for (cv::Mat& channel : channels) {
+        cv::Mat channelFloat;
+        channel.convertTo(channelFloat, CV_32F);
+        cv::multiply(channelFloat, vignette, channelFloat);
+        channelFloat.convertTo(channel, CV_8U);
+    }
+    cv::merge(channels, frame);
+}
+
+void applyNeuralColorGrade(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
+    cv::Mat overlay(frame.size(), frame.type());
+    const cv::Scalar lowMood(255, 208, 235);
+    const cv::Scalar highMood(255, 232, 170);
+    const double mix = std::clamp(static_cast<double>(energy.colorMood), 0.0, 1.0);
+    const cv::Scalar color = lowMood * (1.0 - mix) + highMood * mix;
+    overlay.setTo(color);
+    const double alpha = 0.035 + energy.vocal * 0.030 + energy.ambience * 0.028 + std::sin(timeSeconds * 0.7) * 0.008;
+    cv::addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, frame);
+}
+
+void applyDepthOfField(cv::Mat& frame, const audio::AudioFrameEnergy& energy) {
+    cv::Mat blurred;
+    cv::GaussianBlur(frame, blurred, {0, 0}, 3.0 + energy.ambience * 5.0);
+    cv::Mat mask(frame.rows, frame.cols, CV_32F);
+    const double cx = frame.cols * 0.50;
+    const double cy = frame.rows * 0.56;
+    const double focusRadius = std::min(frame.cols, frame.rows) * (0.24 + energy.vocal * 0.07);
+    for (int y = 0; y < frame.rows; ++y) {
+        float* row = mask.ptr<float>(y);
+        for (int x = 0; x < frame.cols; ++x) {
+            const double dx = static_cast<double>(x) - cx;
+            const double dy = static_cast<double>(y) - cy;
+            const double distance = std::sqrt(dx * dx + dy * dy);
+            row[x] = static_cast<float>(std::clamp((distance - focusRadius) / (focusRadius * 1.9), 0.0, 0.58 + energy.ambience * 0.22));
+        }
+    }
+    cv::Mat frameFloat;
+    cv::Mat blurredFloat;
+    frame.convertTo(frameFloat, CV_32FC3);
+    blurred.convertTo(blurredFloat, CV_32FC3);
+    std::vector<cv::Mat> maskChannels(3, mask);
+    cv::Mat mask3;
+    cv::merge(maskChannels, mask3);
+    cv::multiply(blurredFloat, mask3, blurredFloat);
+    cv::multiply(frameFloat, cv::Scalar(1.0, 1.0, 1.0) - mask3, frameFloat);
+    cv::add(frameFloat, blurredFloat, frameFloat);
+    frameFloat.convertTo(frame, CV_8UC3);
+}
+
+void applyScanlines(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
+    const double strength = 0.006 + energy.dropIntensity * 0.012;
+    for (int y = 0; y < frame.rows; y += 3) {
+        const double wave = 0.5 + 0.5 * std::sin(timeSeconds * 8.0 + y * 0.035);
+        cv::Mat row = frame.row(y);
+        cv::addWeighted(row, 1.0 - strength * wave, cv::Mat(row.size(), row.type(), cv::Scalar(18, 10, 22)), strength * wave, 0.0, row);
+    }
+}
+
+std::string shellQuote(const std::filesystem::path& path) {
+    std::string text = path.string();
+    std::string quoted = "'";
+    for (const char ch : text) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
+bool commandSucceeds(const std::string& command) {
+    return std::system(command.c_str()) == 0;
+}
+
+bool ffmpegHasEncoder(const std::string& encoderName) {
+    std::ostringstream command;
+    command << "ffmpeg -hide_banner -loglevel error -encoders 2>/dev/null | grep -q " << encoderName;
+    return commandSucceeds(command.str());
+}
+
+bool cudaRuntimeAvailable() {
+    return commandSucceeds("ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1'") || std::filesystem::exists("/usr/lib/x86_64-linux-gnu/libcuda.so.1");
+}
+
+bool startsWith(const std::string& text, const std::string& prefix) {
+    return text.rfind(prefix, 0) == 0;
+}
+
+int effectiveRenderThreads(const RenderConfig& config) {
+    const int hardwareThreads = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
+    if (config.renderThreads <= 0) {
+        return std::clamp(hardwareThreads, 1, 48);
+    }
+    return std::clamp(config.renderThreads, 1, 96);
+}
+
+std::string selectedVaapiDevice(const RenderConfig& config) {
+    if (startsWith(config.encoderDevice, "vaapi:")) {
+        return config.encoderDevice.substr(std::string("vaapi:").size());
+    }
+    if (std::filesystem::exists("/dev/dri/renderD128")) {
+        return "/dev/dri/renderD128";
+    }
+    if (std::filesystem::exists("/dev/dri/renderD129")) {
+        return "/dev/dri/renderD129";
+    }
+    return "/dev/dri/renderD128";
+}
+
+int selectedCudaDevice(const RenderConfig& config) {
+    if (!startsWith(config.encoderDevice, "cuda:")) {
+        return 0;
+    }
+    try {
+        return std::max(0, std::stoi(config.encoderDevice.substr(std::string("cuda:").size())));
+    } catch (...) {
+        return 0;
+    }
+}
+
+std::string safeLibx264Preset(const std::string& requestedPreset) {
+    static const std::array<std::string, 10> validPresets = {
+        "ultrafast", "superfast", "veryfast", "faster", "fast",
+        "medium", "slow", "slower", "veryslow", "placebo"
+    };
+    if (std::find(validPresets.begin(), validPresets.end(), requestedPreset) != validPresets.end()) {
+        return requestedPreset;
+    }
+    return "veryfast";
+}
+
+std::string safeNvencPreset(const std::string& requestedPreset) {
+    if (requestedPreset.size() == 2 && requestedPreset[0] == 'p' && requestedPreset[1] >= '1' && requestedPreset[1] <= '7') {
+        return requestedPreset;
+    }
+    return "p5";
+}
+
+bool encoderPreflightSucceeds(const RenderConfig& config, const std::string& backend) {
+    std::ostringstream command;
+    command << "ffmpeg -y -hide_banner -loglevel error "
+            << "-f lavfi -i color=c=black:s=64x64:r=1:d=0.12 "
+            << "-frames:v 1 -an ";
+    const int cq = std::clamp(config.encoderCrf, 10, 28);
+    if (backend == "h264_nvenc") {
+        if (!cudaRuntimeAvailable()) {
+            return false;
+        }
+        command << "-c:v h264_nvenc -gpu " << selectedCudaDevice(config) << " -preset " << safeNvencPreset(config.encoderPreset) << " -tune hq -rc vbr -cq " << cq << " -bf 3 -spatial-aq 1 -temporal-aq 1 -rc-lookahead 20 -surfaces 32 ";
+    } else if (backend == "h264_vaapi") {
+        const std::string device = selectedVaapiDevice(config);
+        if (!std::filesystem::exists(device)) {
+            return false;
+        }
+        command << "-vaapi_device " << shellQuote(device) << " -vf format=nv12,hwupload -c:v h264_vaapi -qp " << cq << ' ';
+    } else {
+        command << "-c:v libx264 -preset " << safeLibx264Preset(config.encoderPreset) << " -crf 28 -pix_fmt yuv420p ";
+    }
+    command << "-f null - >/dev/null 2>&1";
+    return commandSucceeds(command.str());
+}
+
+std::string resolveEncoderBackend(const RenderConfig& config) {
+    const std::string requested = config.encoderBackend.empty() ? "auto" : config.encoderBackend;
+    if (requested != "auto") {
+        if (encoderPreflightSucceeds(config, requested)) {
+            return requested;
+        }
+        if (requested != "libx264" && encoderPreflightSucceeds(config, "libx264")) {
+            return "libx264";
+        }
+        return "libx264";
+    }
+
+    if ((config.encoderDevice == "auto" || startsWith(config.encoderDevice, "cuda:")) && ffmpegHasEncoder("h264_nvenc") && encoderPreflightSucceeds(config, "h264_nvenc")) {
+        return "h264_nvenc";
+    }
+    if ((config.encoderDevice == "auto" || startsWith(config.encoderDevice, "vaapi:")) && ffmpegHasEncoder("h264_vaapi") && encoderPreflightSucceeds(config, "h264_vaapi")) {
+        return "h264_vaapi";
+    }
+    return "libx264";
+}
+
+void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
+    std::ostringstream command;
+    command << "ffmpeg -y -hide_banner -loglevel error "
+            << "-i " << shellQuote(videoOnlyPath) << ' '
+            << "-i " << shellQuote(musicPath) << ' '
+            << "-map 0:v:0 -map 1:a:0 "
+            << "-c:v copy -c:a aac -b:a 320k -shortest -movflags +faststart "
+            << shellQuote(outputPath);
+
+    const int exitCode = std::system(command.str().c_str());
+    if (exitCode != 0) {
+        throw std::runtime_error("FFmpeg 音轨合并失败，请确认已安装 ffmpeg 命令行工具");
+    }
+}
+
+std::string makeRawVideoPipeCommand(const RenderConfig& config, const std::filesystem::path& videoOnlyPath) {
+    std::ostringstream command;
+    const int safeCrf = std::clamp(config.encoderCrf, 10, 28);
+    const int cq = std::clamp(config.encoderCrf, 10, 28);
+    const std::string backend = resolveEncoderBackend(config);
+    command << "ffmpeg -y -hide_banner -loglevel error "
+            << "-f rawvideo -pix_fmt bgr24 "
+            << "-s " << config.width << 'x' << config.height << ' '
+            << "-r " << config.fps << ' '
+            << "-i - -an ";
+    if (backend == "h264_nvenc") {
+        command << "-c:v h264_nvenc -gpu " << selectedCudaDevice(config) << " -preset " << safeNvencPreset(config.encoderPreset) << " -tune hq -rc vbr -cq " << cq << " -bf 3 -spatial-aq 1 -temporal-aq 1 -rc-lookahead 20 -surfaces 32 -pix_fmt yuv420p -movflags +faststart ";
+    } else if (backend == "h264_vaapi") {
+        command << "-vaapi_device " << shellQuote(selectedVaapiDevice(config)) << " -vf format=nv12,hwupload -c:v h264_vaapi -qp " << cq << " -movflags +faststart ";
+    } else {
+        command << "-c:v libx264 -preset " << safeLibx264Preset(config.encoderPreset) << " -crf " << safeCrf << " -pix_fmt yuv420p -movflags +faststart ";
+    }
+    command << shellQuote(videoOnlyPath);
+    return command.str();
+}
+
+cv::Mat composeFrame(
+    const RenderConfig& config,
+    const cv::Mat& base,
+    const cv::Mat& circleCover,
+    const std::vector<lyrics::LyricLine>& lyricLines,
+    const audio::AudioFrameEnergy& energy,
+    double timeSeconds,
+    int frameIndex,
+    int totalFrames) {
+    const double dx = std::sin(timeSeconds * 0.22) * config.parallaxStrength * 0.16;
+    const double dy = std::cos(timeSeconds * 0.18) * config.parallaxStrength * 0.10;
+    const double roll = std::sin(timeSeconds * 0.16) * 0.18;
+    const double scale = 1.035 + energy.bass * config.pulseStrength * 0.42;
+    const cv::Point2f center(static_cast<float>(config.width) * 0.5F, static_cast<float>(config.height) * 0.5F);
+    cv::Mat transform = cv::getRotationMatrix2D(center, roll, scale);
+    transform.at<double>(0, 2) += dx;
+    transform.at<double>(1, 2) += dy;
+
+    cv::Mat frame;
+    cv::warpAffine(base, frame, transform, base.size(), cv::INTER_CUBIC, cv::BORDER_REFLECT101);
+
+    const cv::Scalar accent = estimateLightAccentColor(base);
+    cv::Mat coolWash(frame.size(), frame.type(), cv::Scalar(accent[0], accent[1], accent[2]));
+    cv::addWeighted(coolWash, 0.18, frame, 0.82, 0.0, frame);
+    cv::Mat airyShadow(frame.size(), frame.type(), cv::Scalar(58, 62, 70));
+    cv::addWeighted(airyShadow, 0.16, frame, 0.84, 0.0, frame);
+    drawSoftSnow(frame, timeSeconds, cv::Scalar(255, 255, 255));
+    drawSurroundStage(frame, energy, timeSeconds);
+    drawSongInfo(frame, config, accent, timeSeconds);
+    drawWatermark(frame, config);
+
+    const int coverDiameter = static_cast<int>(std::min(config.width, config.height) * 0.28);
+    const cv::Point coverCenter(static_cast<int>(config.width * 0.27), static_cast<int>(config.height * 0.57));
+    const int blackRingRadius = coverDiameter / 2 + static_cast<int>(std::min(config.width, config.height) * 0.036);
+    const int spectrumRadius = blackRingRadius + static_cast<int>(std::min(config.width, config.height) * 0.022);
+    drawSpectrumRing(frame, energy.spectrumBins, coverCenter, spectrumRadius, config.spectrumBarHeight * 0.58, cv::Scalar(255, 255, 255));
+
+    if (config.enableCircularCover) {
+        cv::circle(frame, coverCenter, blackRingRadius, cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA);
+        alphaBlendCircle(frame, circleCover, {coverCenter.x - coverDiameter / 2, coverCenter.y - coverDiameter / 2}, 0.96);
+        cv::circle(frame, coverCenter, coverDiameter / 2 + 2, cv::Scalar(12, 12, 12), 3, cv::LINE_AA);
+    }
+
+    drawLyricsByLayout(frame, lyricLines, timeSeconds, energy.rms, config.lyricLayoutMode);
+
+    const int progressY = std::max(0, config.height - 5);
+    cv::line(frame, {0, progressY}, {static_cast<int>(config.width * (static_cast<double>(frameIndex) / totalFrames)), progressY}, cv::Scalar(188, 112, 255), 5, cv::LINE_AA);
+
+    return frame;
+}
+
+} // namespace
+
+VideoRenderer::VideoRenderer() = default;
+VideoRenderer::~VideoRenderer() = default;
+
+void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& onProgress, const CancelCallback& shouldCancel, const PreviewFrameCallback& onPreviewFrame) const {
+    if (config.backgroundImagePath.empty() || config.musicPath.empty() || config.lyricPath.empty() || config.outputVideoPath.empty()) {
+        throw std::runtime_error("背景、音乐、歌词、输出路径都必须选择");
+    }
+
+    std::signal(SIGPIPE, SIG_IGN);
+
+    cv::Mat background = cv::imread(config.backgroundImagePath.string(), cv::IMREAD_COLOR);
+    if (background.empty()) {
+        throw std::runtime_error("无法读取背景图片: " + config.backgroundImagePath.string());
+    }
+
+    audio::AudioAnalyzer analyzer;
+    const audio::AudioAnalysisResult analysis = analyzer.analyze(config.musicPath, config.fps);
+
+    lyrics::LrcParser parser;
+    const std::vector<lyrics::LyricLine> lyricLines = parser.parse(config.lyricPath);
+
+    const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * config.fps)));
+    const std::filesystem::path outputPath = config.outputVideoPath;
+    const std::filesystem::path videoOnlyPath = outputPath.parent_path() / (outputPath.stem().string() + ".video_only.mp4");
+
+    FILE* encoderPipe = popen(makeRawVideoPipeCommand(config, videoOnlyPath).c_str(), "w");
+    if (encoderPipe == nullptr) {
+        throw std::runtime_error("无法启动 FFmpeg 管线编码器，请确认已安装 ffmpeg 命令行工具");
+    }
+
+    const cv::Mat base = coverResize(background, config.width, config.height);
+    const int coverDiameter = static_cast<int>(std::min(config.width, config.height) * 0.28);
+    const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
+    const int renderThreads = effectiveRenderThreads(config);
+    const std::size_t bytesPerFrame = static_cast<std::size_t>(config.width) * static_cast<std::size_t>(config.height) * 3U;
+    const int memorySafeBatch = static_cast<int>(std::clamp<std::size_t>((512U * 1024U * 1024U) / std::max<std::size_t>(1U, bytesPerFrame), 1U, 192U));
+    const int requestedBatch = config.renderBatchFrames > 0 ? config.renderBatchFrames : renderThreads * 3;
+    const int batchSize = std::max(1, std::min(requestedBatch, memorySafeBatch));
+
+    if (onProgress) {
+        RenderProgress setupProgress;
+        setupProgress.currentFrame = 0;
+        setupProgress.totalFrames = totalFrames;
+        setupProgress.progress = 0.0;
+        if (config.renderBackend.find("webgpu") != std::string::npos) {
+            setupProgress.message = "WebGPU 全局模式：优先使用 WebGPU 路径，不可用时兼容合成 + GPU 编码回退";
+        } else {
+            setupProgress.message = "使用 CPU/OpenMP 合成 + 自动编码器";
+        }
+        onProgress(setupProgress);
+    }
+
+    for (int batchStart = 0; batchStart < totalFrames; batchStart += batchSize) {
+        if (shouldCancel && shouldCancel()) {
+            pclose(encoderPipe);
+            std::error_code removeError;
+            std::filesystem::remove(videoOnlyPath, removeError);
+            throw std::runtime_error("渲染已由用户取消");
+        }
+
+        const int batchEnd = std::min(totalFrames, batchStart + batchSize);
+        const int currentBatchSize = batchEnd - batchStart;
+        std::vector<cv::Mat> frames(static_cast<std::size_t>(currentBatchSize));
+
+#if LIREAL_HAS_OPENMP
+#pragma omp parallel for schedule(dynamic) num_threads(renderThreads)
+#endif
+        for (int localIndex = 0; localIndex < currentBatchSize; ++localIndex) {
+            const int frameIndex = batchStart + localIndex;
+            const double t = static_cast<double>(frameIndex) / static_cast<double>(config.fps);
+            const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
+            frames[static_cast<std::size_t>(localIndex)] = composeFrame(config, base, circleCover, lyricLines, energy, t, frameIndex, totalFrames);
+        }
+
+        for (int localIndex = 0; localIndex < currentBatchSize; ++localIndex) {
+            if (shouldCancel && shouldCancel()) {
+                pclose(encoderPipe);
+                std::error_code removeError;
+                std::filesystem::remove(videoOnlyPath, removeError);
+                throw std::runtime_error("渲染已由用户取消");
+            }
+
+            const int frameIndex = batchStart + localIndex;
+            cv::Mat frame = frames[static_cast<std::size_t>(localIndex)];
+            if (onPreviewFrame && (frameIndex % std::max(1, config.fps / 6) == 0 || frameIndex + 1 == totalFrames)) {
+                cv::Mat rgb;
+                cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
+                QImage image(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
+                const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
+                onPreviewFrame(image.copy(), frameIndex + 1, totalFrames, energy);
+            }
+            if (!frame.isContinuous()) {
+                frame = frame.clone();
+            }
+            const std::size_t bytesToWrite = static_cast<std::size_t>(frame.total()) * static_cast<std::size_t>(frame.elemSize());
+            const std::size_t bytesWritten = fwrite(frame.data, 1U, bytesToWrite, encoderPipe);
+            if (bytesWritten != bytesToWrite) {
+                pclose(encoderPipe);
+                std::error_code removeError;
+                std::filesystem::remove(videoOnlyPath, removeError);
+                throw std::runtime_error("FFmpeg 管线写入失败，视频编码中断");
+            }
+
+            if (onProgress && (frameIndex % std::max(1, config.fps / 4) == 0 || frameIndex + 1 == totalFrames)) {
+                onProgress({frameIndex + 1, totalFrames, static_cast<double>(frameIndex + 1) / static_cast<double>(totalFrames), "多线程合成并编码音画帧"});
+            }
+        }
+    }
+
+    if (pclose(encoderPipe) != 0) {
+        std::error_code removeError;
+        std::filesystem::remove(videoOnlyPath, removeError);
+        throw std::runtime_error("FFmpeg 视频编码失败");
+    }
+
+    if (onProgress) {
+        onProgress({totalFrames, totalFrames, 0.985, "正在合并原始音乐音轨"});
+    }
+
+    if (shouldCancel && shouldCancel()) {
+        std::error_code removeError;
+        std::filesystem::remove(videoOnlyPath, removeError);
+        throw std::runtime_error("渲染已由用户取消");
+    }
+
+    muxAudioWithFfmpeg(videoOnlyPath, config.musicPath, outputPath);
+    std::error_code removeError;
+    std::filesystem::remove(videoOnlyPath, removeError);
+
+    if (onProgress) {
+        onProgress({totalFrames, totalFrames, 1.0, "渲染完成"});
+    }
+}
+
+void VideoRenderer::renderPreviewImage(const RenderConfig& config, const std::filesystem::path& previewPath, double preferredTimeSeconds) const {
+    if (config.backgroundImagePath.empty() || config.musicPath.empty() || config.lyricPath.empty()) {
+        throw std::runtime_error("背景、音乐、歌词都必须选择后才能生成预览图");
+    }
+
+    cv::Mat background = cv::imread(config.backgroundImagePath.string(), cv::IMREAD_COLOR);
+    if (background.empty()) {
+        throw std::runtime_error("无法读取背景图片: " + config.backgroundImagePath.string());
+    }
+
+    audio::AudioAnalyzer analyzer;
+    const audio::AudioAnalysisResult analysis = analyzer.analyze(config.musicPath, config.fps);
+    if (analysis.frames.empty()) {
+        throw std::runtime_error("无法从音乐中生成预览驱动数据");
+    }
+
+    lyrics::LrcParser parser;
+    const std::vector<lyrics::LyricLine> lyricLines = parser.parse(config.lyricPath);
+
+    const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * config.fps)));
+    const double previewTime = std::clamp(preferredTimeSeconds, 0.0, std::max(0.0, analysis.durationSeconds - 0.05));
+    const int frameIndex = std::clamp(static_cast<int>(previewTime * config.fps), 0, totalFrames - 1);
+
+    const cv::Mat base = coverResize(background, config.width, config.height);
+    const int coverDiameter = static_cast<int>(std::min(config.width, config.height) * 0.28);
+    const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
+    const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
+    cv::Mat frame = composeFrame(config, base, circleCover, lyricLines, energy, previewTime, frameIndex, totalFrames);
+
+    std::filesystem::create_directories(previewPath.parent_path());
+    if (!cv::imwrite(previewPath.string(), frame)) {
+        throw std::runtime_error("无法写入预览图: " + previewPath.string());
+    }
+}
+
+void VideoRenderer::renderPreviewStream(const RenderConfig& config, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel) const {
+    if (config.backgroundImagePath.empty() || config.musicPath.empty() || config.lyricPath.empty()) {
+        throw std::runtime_error("背景、音乐、歌词都必须选择后才能打开实时预览");
+    }
+
+    cv::Mat background = cv::imread(config.backgroundImagePath.string(), cv::IMREAD_COLOR);
+    if (background.empty()) {
+        throw std::runtime_error("无法读取背景图片: " + config.backgroundImagePath.string());
+    }
+
+    audio::AudioAnalyzer analyzer;
+    const audio::AudioAnalysisResult analysis = analyzer.analyze(config.musicPath, config.fps);
+    if (analysis.frames.empty()) {
+        throw std::runtime_error("无法从音乐中生成预览驱动数据");
+    }
+
+    lyrics::LrcParser parser;
+    const std::vector<lyrics::LyricLine> lyricLines = parser.parse(config.lyricPath);
+
+    const cv::Mat base = coverResize(background, config.width, config.height);
+    const int coverDiameter = static_cast<int>(std::min(config.width, config.height) * 0.28);
+    const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
+    const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * config.fps)));
+    const double safeStart = std::clamp(startSeconds, 0.0, std::max(0.0, analysis.durationSeconds - 0.05));
+    const double safeDuration = std::clamp(durationSeconds, 0.5, std::max(0.5, analysis.durationSeconds - safeStart));
+    const int previewFrames = std::max(1, static_cast<int>(std::ceil(safeDuration * config.fps)));
+
+    for (int previewIndex = 0; previewIndex < previewFrames; ++previewIndex) {
+        if (shouldCancel && shouldCancel()) {
+            return;
+        }
+        const double timeSeconds = std::min(analysis.durationSeconds, safeStart + static_cast<double>(previewIndex) / static_cast<double>(config.fps));
+        const int frameIndex = std::clamp(static_cast<int>(timeSeconds * config.fps), 0, totalFrames - 1);
+        const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
+        cv::Mat frame = composeFrame(config, base, circleCover, lyricLines, energy, timeSeconds, frameIndex, totalFrames);
+        cv::Mat rgb;
+        cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
+        QImage image(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
+        onFrame(image.copy(), previewIndex + 1, previewFrames, energy);
+    }
+}
+
+} // namespace lireal::render

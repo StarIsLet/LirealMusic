@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Lireal Music - C++ audio visual rendering engine.
+# Copyright (C) 2026 Lireal contributors
+
+# Build outputs
+/build/
+/out/
+/dist/
+/result
+/result-*
+
+# CMake / Ninja
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.ninja
+
+# Generated binaries and libraries
+/lireal
+/lireal_tui
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large local media samples
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.flac
+*.wav
+*.mp3
+*.aac
+*.ogg
+
+# Crash dumps / logs
+core
+core.*
+*.log
