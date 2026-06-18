@@ -1008,6 +1008,19 @@ bool commandSucceeds(const std::string& command) {
     return std::system(command.c_str()) == 0;
 }
 
+std::string shellQuoteText(const std::string& text) {
+    std::string quoted = "'";
+    for (const char ch : text) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += ch;
+        }
+    }
+    quoted += "'";
+    return quoted;
+}
+
 bool ffmpegHasEncoder(const std::string& encoderName) {
     std::ostringstream command;
     command << "ffmpeg -hide_banner -loglevel error -encoders 2>/dev/null | grep -q " << encoderName;
@@ -1118,16 +1131,36 @@ std::string resolveEncoderBackend(const RenderConfig& config) {
 }
 
 void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
+    const std::string surroundFilter =
+        "[1:a]aformat=channel_layouts=stereo,volume=0.92,asplit=4[dry][wide][air][bass];"
+        "[wide]highpass=f=170,adelay=0|22,aecho=0.42:0.48:36|72:0.13|0.08,aphaser=in_gain=0.72:out_gain=0.78:delay=2.3:decay=0.38:speed=0.33[wide3d];"
+        "[air]highpass=f=2600,adelay=13|0,aecho=0.34:0.44:58|116:0.10|0.06[air3d];"
+        "[bass]lowpass=f=155,pan=stereo|c0=0.62*c0+0.38*c1|c1=0.38*c0+0.62*c1[basscenter];"
+        "[dry][wide3d][air3d][basscenter]amix=inputs=4:weights=0.72 0.42 0.20 0.36:normalize=0,alimiter=limit=0.94[aout]";
+
     std::ostringstream command;
     command << "ffmpeg -y -hide_banner -loglevel error "
             << "-i " << shellQuote(videoOnlyPath) << ' '
             << "-i " << shellQuote(musicPath) << ' '
-            << "-map 0:v:0 -map 1:a:0 "
+            << "-filter_complex " << shellQuoteText(surroundFilter) << ' '
+            << "-map 0:v:0 -map [aout] "
             << "-c:v copy -c:a aac -b:a 320k -shortest -movflags +faststart "
             << shellQuote(outputPath);
 
     const int exitCode = std::system(command.str().c_str());
-    if (exitCode != 0) {
+    if (exitCode == 0) {
+        return;
+    }
+
+    std::ostringstream fallbackCommand;
+    fallbackCommand << "ffmpeg -y -hide_banner -loglevel error "
+                    << "-i " << shellQuote(videoOnlyPath) << ' '
+                    << "-i " << shellQuote(musicPath) << ' '
+                    << "-map 0:v:0 -map 1:a:0 "
+                    << "-c:v copy -c:a aac -b:a 320k -shortest -movflags +faststart "
+                    << shellQuote(outputPath);
+
+    if (std::system(fallbackCommand.str().c_str()) != 0) {
         throw std::runtime_error("FFmpeg 音轨合并失败，请确认已安装 ffmpeg 命令行工具");
     }
 }
