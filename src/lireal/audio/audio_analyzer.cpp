@@ -276,6 +276,8 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
     std::vector<float> maxBins(64, 0.000001F);
     std::vector<float> maxNeuralStemEnergy(hasNeuralSeparation ? neuralSeparation.stems.size() : 0U, 0.000001F);
     float previousRms = 0.0F;
+    float previousBass = 0.0F;
+    float previousPercussion = 0.0F;
     std::vector<float> previousSpectrumBins(64, 0.0F);
 
     for (int frameIndex = 0; frameIndex < totalFrames; ++frameIndex) {
@@ -347,15 +349,25 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
         }
         energy.spectralCentroid = static_cast<float>(std::clamp((centroidWeighted / (centroidEnergy + 0.000001)) / 9000.0, 0.0, 1.0));
         double positiveFlux = 0.0;
+        double positiveLowFlux = 0.0;
         for (std::size_t bin = 0; bin < energy.spectrumBins.size(); ++bin) {
-            positiveFlux += std::max(0.0F, energy.spectrumBins[bin] - previousSpectrumBins[bin]);
+            const float binRise = std::max(0.0F, energy.spectrumBins[bin] - previousSpectrumBins[bin]);
+            positiveFlux += binRise;
+            if (bin < 14U) {
+                positiveLowFlux += binRise * (1.0 + static_cast<double>(14U - bin) / 14.0);
+            }
         }
         energy.spectralFlux = static_cast<float>(positiveFlux / static_cast<double>(std::max<std::size_t>(1U, energy.spectrumBins.size())));
         for (std::size_t bin = 0; bin < energy.spectrumBins.size(); ++bin) {
             previousSpectrumBins[bin] = energy.spectrumBins[bin];
         }
-        energy.beatPulse = std::max({energy.transient * 1.85F, energy.spectralFlux * 0.88F, energy.bass * 0.26F});
-        energy.dropIntensity = std::clamp(energy.bass * 0.66F + energy.percussion * 0.34F + energy.spectralFlux * 0.66F, 0.0F, 8.0F);
+        const float bassRise = std::max(0.0F, energy.bass - previousBass);
+        const float percussionRise = std::max(0.0F, energy.percussion - previousPercussion);
+        const float lowFlux = static_cast<float>(positiveLowFlux / 14.0);
+        previousBass = energy.bass;
+        previousPercussion = energy.percussion;
+        energy.beatPulse = std::max({energy.transient * 2.25F, energy.spectralFlux * 0.96F, lowFlux * 1.42F, bassRise * 1.55F, percussionRise * 1.18F});
+        energy.dropIntensity = std::clamp(energy.bass * 0.72F + energy.percussion * 0.42F + lowFlux * 1.10F + energy.spectralFlux * 0.52F, 0.0F, 9.0F);
         energy.colorMood = std::clamp(energy.spectralCentroid * 0.50F + energy.vocal * 0.24F + energy.ambience * 0.26F, 0.0F, 1.0F);
 
         const float pan = static_cast<float>(std::clamp((rightRms - leftRms) / (leftRms + rightRms + 0.000001), -1.0, 1.0));
@@ -456,8 +468,10 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
         smoothAmbience = smoothAttackRelease(smoothAmbience, normalizeEnergy(energy.ambience, maxAmbience, 1.18F), 0.42F, 0.12F);
         smoothTransient = smoothAttackRelease(smoothTransient, normalizeEnergy(energy.transient, maxTransient, 1.38F), 0.70F, 0.22F);
         smoothSpectralFlux = smoothAttackRelease(smoothSpectralFlux, normalizeEnergy(energy.spectralFlux, maxSpectralFlux, 1.32F), 0.68F, 0.18F);
-        smoothBeatPulse = smoothAttackRelease(smoothBeatPulse, normalizeEnergy(energy.beatPulse, maxBeatPulse, 1.45F), 0.82F, 0.16F);
-        smoothDropIntensity = smoothAttackRelease(smoothDropIntensity, normalizeEnergy(energy.dropIntensity, maxDropIntensity, 1.24F), 0.72F, 0.12F);
+        const float punchTarget = std::clamp(normalizeEnergy(energy.beatPulse, maxBeatPulse, 1.60F) * 0.78F + smoothBass * 0.15F + smoothPercussion * 0.18F, 0.0F, 1.0F);
+        const float dropTarget = std::clamp(normalizeEnergy(energy.dropIntensity, maxDropIntensity, 1.42F) * 0.74F + smoothBass * 0.22F + smoothSpectralFlux * 0.18F, 0.0F, 1.0F);
+        smoothBeatPulse = smoothAttackRelease(smoothBeatPulse, punchTarget, 0.92F, 0.10F);
+        smoothDropIntensity = smoothAttackRelease(smoothDropIntensity, dropTarget, 0.82F, 0.09F);
         smoothColorMood = smoothAttackRelease(smoothColorMood, energy.colorMood, 0.18F, 0.08F);
         energy.rms = smoothRms;
         energy.bass = smoothBass;

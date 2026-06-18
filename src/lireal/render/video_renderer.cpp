@@ -106,6 +106,9 @@ void drawSpectrumRing(cv::Mat& frame, const std::vector<float>& bins, cv::Point 
         return;
     }
 
+    cv::Mat glow = cv::Mat::zeros(frame.size(), frame.type());
+    cv::Mat crisp = cv::Mat::zeros(frame.size(), frame.type());
+
     static const std::array<double, 64> cosTable = []() {
         std::array<double, 64> values{};
         for (std::size_t index = 0; index < values.size(); ++index) {
@@ -126,8 +129,13 @@ void drawSpectrumRing(cv::Mat& frame, const std::vector<float>& bins, cv::Point 
     for (std::size_t index = 0; index < bins.size(); ++index) {
         const std::size_t tableIndex = index % cosTable.size();
         const double level = std::clamp(static_cast<double>(bins[index]), 0.0, 1.0);
-        const double inner = radius;
-        const double outer = radius + 10.0 + barHeight * level;
+        const double harmonic = 0.5 + 0.5 * std::sin(static_cast<double>(index) * 0.37 + level * 2.6);
+        const cv::Scalar reactiveColor(
+            std::clamp(color[0] + 16.0 * harmonic, 0.0, 255.0),
+            std::clamp(color[1] - 18.0 + level * 54.0, 0.0, 255.0),
+            std::clamp(color[2] - 8.0 + harmonic * 42.0, 0.0, 255.0));
+        const double inner = radius - 3.0 - level * 5.0;
+        const double outer = radius + 12.0 + barHeight * (0.22 + level * 1.08);
         const cv::Point p1(
             center.x + static_cast<int>(cosTable[tableIndex] * inner),
             center.y + static_cast<int>(sinTable[tableIndex] * inner));
@@ -135,8 +143,21 @@ void drawSpectrumRing(cv::Mat& frame, const std::vector<float>& bins, cv::Point 
             center.x + static_cast<int>(cosTable[tableIndex] * outer),
             center.y + static_cast<int>(sinTable[tableIndex] * outer));
         const int thickness = 2 + static_cast<int>(level * 4.0);
-        cv::line(frame, p1, p2, color, thickness, cv::LINE_AA);
+        cv::line(glow, p1, p2, reactiveColor, thickness + 7, cv::LINE_AA);
+        cv::line(crisp, p1, p2, reactiveColor, thickness, cv::LINE_AA);
+
+        if (index % 2U == 0U) {
+            const double mirrorOuter = radius - 8.0 - barHeight * 0.26 * level;
+            const cv::Point p3(
+                center.x + static_cast<int>(cosTable[tableIndex] * mirrorOuter),
+                center.y + static_cast<int>(sinTable[tableIndex] * mirrorOuter));
+            cv::line(glow, p1, p3, reactiveColor, std::max(1, thickness - 1), cv::LINE_AA);
+        }
     }
+
+    cv::GaussianBlur(glow, glow, {0, 0}, 4.8);
+    cv::addWeighted(glow, 0.62, frame, 1.0, 0.0, frame);
+    cv::addWeighted(crisp, 0.95, frame, 1.0, 0.0, frame);
 }
 
 QFont makeLyricFont(int pixelSize, bool active, const std::string& requestedFamily = {});
@@ -474,8 +495,54 @@ void addImpactFlash(cv::Mat& frame, float bassEnergy) {
     cv::addWeighted(flash, alpha, frame, 1.0 - alpha, 0.0, frame);
 }
 
+void drawAuroraRibbons(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    const int lanes = 5;
+    const int points = 96;
+    for (int lane = 0; lane < lanes; ++lane) {
+        std::vector<cv::Point> polyline;
+        polyline.reserve(points);
+        const double phase = timeSeconds * (0.42 + lane * 0.07) + lane * 1.31;
+        const double baseY = frame.rows * (0.24 + lane * 0.105);
+        const double amp = frame.rows * (0.020 + energy.vocal * 0.035 + energy.dropIntensity * 0.030 + lane * 0.004);
+        for (int i = 0; i < points; ++i) {
+            const double xRatio = static_cast<double>(i) / static_cast<double>(points - 1);
+            const std::size_t binIndex = energy.spectrumBins.empty() ? 0U : static_cast<std::size_t>((i * energy.spectrumBins.size()) / points) % energy.spectrumBins.size();
+            const double bin = energy.spectrumBins.empty() ? energy.rms : energy.spectrumBins[binIndex];
+            const double wave = std::sin(xRatio * CV_PI * (2.2 + lane * 0.45) + phase) + std::sin(xRatio * CV_PI * 6.0 - phase * 1.7) * 0.35;
+            const int x = static_cast<int>(xRatio * frame.cols);
+            const int y = static_cast<int>(baseY + wave * amp + (bin - 0.5) * frame.rows * 0.055);
+            polyline.emplace_back(std::clamp(x, 0, frame.cols - 1), std::clamp(y, 0, frame.rows - 1));
+        }
+        const cv::Scalar color(
+            255,
+            182 + lane * 10 + energy.colorMood * 34.0F,
+            218 + energy.vocal * 36.0F + lane * 5);
+        cv::polylines(layer, polyline, false, color, 2 + static_cast<int>(energy.dropIntensity * 4.0F), cv::LINE_AA);
+    }
+    cv::GaussianBlur(layer, layer, {0, 0}, 5.5 + energy.ambience * 4.0 + energy.dropIntensity * 2.5);
+    cv::addWeighted(layer, 0.24 + energy.rms * 0.20 + energy.beatPulse * 0.18, frame, 1.0, 0.0, frame);
+}
+
+void drawBassHalo(cv::Mat& frame, const audio::AudioFrameEnergy& energy, cv::Point center, int radius) {
+    if (energy.bass < 0.10F && energy.beatPulse < 0.10F) {
+        return;
+    }
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    const float power = std::clamp(energy.bass * 0.62F + energy.beatPulse * 0.52F + energy.dropIntensity * 0.34F, 0.0F, 1.0F);
+    for (int ring = 0; ring < 4; ++ring) {
+        const int r = radius + static_cast<int>((18 + ring * 24) * (0.6F + power));
+        const int thickness = 2 + static_cast<int>(power * 7.0F) - ring;
+        const cv::Scalar color(255, 205 + ring * 9, 238 + energy.colorMood * 15.0F);
+        cv::circle(layer, center, r, color, std::max(1, thickness), cv::LINE_AA);
+    }
+    cv::GaussianBlur(layer, layer, {0, 0}, 7.0 + power * 6.0);
+    cv::addWeighted(layer, 0.28 + power * 0.44, frame, 1.0, 0.0, frame);
+}
+
 void drawParticles(cv::Mat& frame, double timeSeconds, float energy) {
-    constexpr int particleCount = 128;
+    cv::Mat layer = cv::Mat::zeros(frame.size(), frame.type());
+    constexpr int particleCount = 168;
     for (int index = 0; index < particleCount; ++index) {
         const double seed = static_cast<double>(index + 1) * 12.9898;
         const double rawX = std::sin(seed) * 43758.5453;
@@ -485,10 +552,12 @@ void drawParticles(cv::Mat& frame, double timeSeconds, float energy) {
         const double drift = std::fmod(timeSeconds * (0.035 + index % 7 * 0.006) + baseY, 1.0);
         const int x = static_cast<int>(baseX * frame.cols + std::sin(timeSeconds * 1.4 + index) * 42.0 * energy);
         const int y = static_cast<int>(drift * frame.rows);
-        const int size = 2 + (index % 5);
-        const cv::Scalar color = index % 3 == 0 ? cv::Scalar(255, 225, 245) : cv::Scalar(235, 235, 240);
-        cv::circle(frame, {std::clamp(x, 0, frame.cols - 1), std::clamp(y, 0, frame.rows - 1)}, size, color, cv::FILLED, cv::LINE_AA);
+        const int size = 1 + (index % 4) + static_cast<int>(energy * 3.0F);
+        const cv::Scalar color = index % 3 == 0 ? cv::Scalar(255, 225 + energy * 25.0F, 245) : cv::Scalar(235, 235, 248);
+        cv::circle(layer, {std::clamp(x, 0, frame.cols - 1), std::clamp(y, 0, frame.rows - 1)}, size, color, cv::FILLED, cv::LINE_AA);
     }
+    cv::GaussianBlur(layer, layer, {0, 0}, 0.9 + energy * 1.6);
+    cv::addWeighted(layer, 0.62 + energy * 0.22, frame, 1.0, 0.0, frame);
 }
 
 void drawAudioComets(cv::Mat& frame, const audio::AudioFrameEnergy& energy, double timeSeconds) {
@@ -1111,6 +1180,7 @@ cv::Mat composeFrame(
     cv::Mat airyShadow(frame.size(), frame.type(), cv::Scalar(58, 62, 70));
     cv::addWeighted(airyShadow, 0.16, frame, 0.84, 0.0, frame);
     drawSoftSnow(frame, timeSeconds, cv::Scalar(255, 255, 255));
+    drawAuroraRibbons(frame, energy, timeSeconds);
     drawSurroundStage(frame, energy, timeSeconds);
     drawSongInfo(frame, config, accent, timeSeconds);
     drawWatermark(frame, config);
@@ -1119,6 +1189,7 @@ cv::Mat composeFrame(
     const cv::Point coverCenter(static_cast<int>(config.width * 0.27), static_cast<int>(config.height * 0.57));
     const int blackRingRadius = coverDiameter / 2 + static_cast<int>(std::min(config.width, config.height) * 0.036);
     const int spectrumRadius = blackRingRadius + static_cast<int>(std::min(config.width, config.height) * 0.022);
+    drawBassHalo(frame, energy, coverCenter, spectrumRadius);
     drawSpectrumRing(frame, energy.spectrumBins, coverCenter, spectrumRadius, config.spectrumBarHeight * 0.58, cv::Scalar(255, 255, 255));
 
     if (config.enableCircularCover) {
@@ -1128,6 +1199,14 @@ cv::Mat composeFrame(
     }
 
     drawLyricsByLayout(frame, lyricLines, timeSeconds, energy.rms, config.lyricLayoutMode);
+    drawParticles(frame, timeSeconds, std::max(energy.rms, energy.beatPulse));
+    drawAudioComets(frame, energy, timeSeconds);
+    drawBeatShockwaves(frame, energy, timeSeconds);
+    drawStarbursts(frame, energy, timeSeconds);
+    addImpactFlash(frame, energy.dropIntensity);
+    addBloom(frame, 0.045 + energy.ambience * 0.030 + energy.beatPulse * 0.050);
+    applyNeuralColorGrade(frame, energy, timeSeconds);
+    applyDreamGrade(frame, timeSeconds, std::max(energy.rms, energy.dropIntensity));
 
     const int progressY = std::max(0, config.height - 5);
     cv::line(frame, {0, progressY}, {static_cast<int>(config.width * (static_cast<double>(frameIndex) / totalFrames)), progressY}, cv::Scalar(188, 112, 255), 5, cv::LINE_AA);
