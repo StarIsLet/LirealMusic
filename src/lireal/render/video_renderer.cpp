@@ -1132,11 +1132,30 @@ std::string resolveEncoderBackend(const RenderConfig& config) {
 
 void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
     const std::string surroundFilter =
-        "[1:a]aformat=channel_layouts=stereo,volume=0.92,asplit=4[dry][wide][air][bass];"
-        "[wide]highpass=f=170,adelay=0|22,aecho=0.42:0.48:36|72:0.13|0.08,aphaser=in_gain=0.72:out_gain=0.78:delay=2.3:decay=0.38:speed=0.33[wide3d];"
-        "[air]highpass=f=2600,adelay=13|0,aecho=0.34:0.44:58|116:0.10|0.06[air3d];"
-        "[bass]lowpass=f=155,pan=stereo|c0=0.62*c0+0.38*c1|c1=0.38*c0+0.62*c1[basscenter];"
-        "[dry][wide3d][air3d][basscenter]amix=inputs=4:weights=0.72 0.42 0.20 0.36:normalize=0,alimiter=limit=0.94[aout]";
+        "[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+        "highpass=f=24,lowpass=f=20500,"
+        "equalizer=f=62:t=q:w=1.05:g=1.4,"
+        "equalizer=f=230:t=q:w=1.20:g=-0.8,"
+        "equalizer=f=3200:t=q:w=1.10:g=0.9,"
+        "equalizer=f=9800:t=q:w=0.85:g=1.2,"
+        "dynaudnorm=f=250:g=9:p=0.62:m=12:s=18,"
+        "asplit=5[dry][wide][air][bass][glue];"
+        "[wide]highpass=f=145,lowpass=f=13500,"
+        "adelay=0|18,"
+        "aecho=0.30:0.42:28|56|92:0.12|0.08|0.045,"
+        "aphaser=in_gain=0.62:out_gain=0.74:delay=2.1:decay=0.30:speed=0.24,"
+        "pan=stereo|c0=0.92*c0+0.16*c1|c1=0.16*c0+0.92*c1[wide3d];"
+        "[air]highpass=f=3600,adelay=11|0,"
+        "aecho=0.22:0.36:46|88|132:0.08|0.055|0.035,"
+        "volume=0.72[air3d];"
+        "[bass]lowpass=f=135,"
+        "pan=stereo|c0=0.70*c0+0.30*c1|c1=0.30*c0+0.70*c1,"
+        "volume=0.92[basscenter];"
+        "[glue]bandpass=f=950:w=3600,acompressor=threshold=0.18:ratio=1.45:attack=18:release=160:makeup=1.35[body];"
+        "[dry][wide3d][air3d][basscenter][body]amix=inputs=5:weights=0.82 0.34 0.16 0.30 0.18:normalize=0,"
+        "acompressor=threshold=0.72:ratio=1.35:attack=8:release=120:makeup=1.03,"
+        "alimiter=limit=0.965:level=disabled,"
+        "aresample=48000:resampler=soxr:precision=28[aout]";
 
     std::ostringstream command;
     command << "ffmpeg -y -hide_banner -loglevel error "
@@ -1144,7 +1163,7 @@ void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::f
             << "-i " << shellQuote(musicPath) << ' '
             << "-filter_complex " << shellQuoteText(surroundFilter) << ' '
             << "-map 0:v:0 -map [aout] "
-            << "-c:v copy -c:a aac -b:a 320k -shortest -movflags +faststart "
+            << "-c:v copy -c:a aac -b:a 512k -ar 48000 -shortest -movflags +faststart "
             << shellQuote(outputPath);
 
     const int exitCode = std::system(command.str().c_str());
@@ -1157,7 +1176,7 @@ void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::f
                     << "-i " << shellQuote(videoOnlyPath) << ' '
                     << "-i " << shellQuote(musicPath) << ' '
                     << "-map 0:v:0 -map 1:a:0 "
-                    << "-c:v copy -c:a aac -b:a 320k -shortest -movflags +faststart "
+                    << "-c:v copy -c:a aac -b:a 512k -ar 48000 -shortest -movflags +faststart "
                     << shellQuote(outputPath);
 
     if (std::system(fallbackCommand.str().c_str()) != 0) {
