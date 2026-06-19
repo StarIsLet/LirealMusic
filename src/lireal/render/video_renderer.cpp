@@ -1157,6 +1157,12 @@ bool ffmpegHasEncoder(const std::string& encoderName) {
     return commandSucceeds(command.str());
 }
 
+bool ffmpegHasFilter(const std::string& filterName) {
+    std::ostringstream command;
+    command << "ffmpeg -hide_banner -loglevel error -filters 2>/dev/null | grep -q '[[:space:]]" << filterName << "[[:space:]]'";
+    return commandSucceeds(command.str());
+}
+
 bool cudaRuntimeAvailable() {
     return commandSucceeds("ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1'") || std::filesystem::exists("/usr/lib/x86_64-linux-gnu/libcuda.so.1");
 }
@@ -1261,31 +1267,39 @@ std::string resolveEncoderBackend(const RenderConfig& config) {
 }
 
 void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
+    const std::string hifiPreEq = ffmpegHasFilter("firequalizer")
+        ? "firequalizer=gain_entry='entry(28,-3.2);entry(42,-1.2);entry(64,1.8);entry(110,1.0);entry(240,-1.4);entry(520,-0.6);entry(1200,0.45);entry(3200,1.15);entry(7200,0.9);entry(11200,1.5);entry(16000,0.8)':zero_phase=on:delay=0.018,"
+        : "equalizer=f=64:t=q:w=1.05:g=1.6,equalizer=f=240:t=q:w=1.20:g=-1.1,equalizer=f=3200:t=q:w=1.05:g=1.0,equalizer=f=11200:t=q:w=0.85:g=1.3,";
     const std::string surroundFilter =
         "[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-        "highpass=f=24,lowpass=f=20500,"
-        "equalizer=f=62:t=q:w=1.05:g=1.4,"
-        "equalizer=f=230:t=q:w=1.20:g=-0.8,"
-        "equalizer=f=3200:t=q:w=1.10:g=0.9,"
-        "equalizer=f=9800:t=q:w=0.85:g=1.2,"
-        "dynaudnorm=f=250:g=9:p=0.62:m=12:s=18,"
-        "asplit=5[dry][wide][air][bass][glue];"
-        "[wide]highpass=f=145,lowpass=f=13500,"
-        "adelay=0|18,"
-        "aecho=0.30:0.42:28|56|92:0.12|0.08|0.045,"
-        "aphaser=in_gain=0.62:out_gain=0.74:delay=2.1:decay=0.30:speed=0.24,"
-        "pan=stereo|c0=0.92*c0+0.16*c1|c1=0.16*c0+0.92*c1[wide3d];"
-        "[air]highpass=f=3600,adelay=11|0,"
-        "aecho=0.22:0.36:46|88|132:0.08|0.055|0.035,"
-        "volume=0.72[air3d];"
-        "[bass]lowpass=f=135,"
-        "pan=stereo|c0=0.70*c0+0.30*c1|c1=0.30*c0+0.70*c1,"
-        "volume=0.92[basscenter];"
-        "[glue]bandpass=f=950:w=3600,acompressor=threshold=0.18:ratio=1.45:attack=18:release=160:makeup=1.35[body];"
-        "[dry][wide3d][air3d][basscenter][body]amix=inputs=5:weights=0.82 0.34 0.16 0.30 0.18:normalize=0,"
-        "acompressor=threshold=0.72:ratio=1.35:attack=8:release=120:makeup=1.03,"
-        "alimiter=limit=0.965:level=disabled,"
-        "aresample=48000:resampler=soxr:precision=28[aout]";
+        "highpass=f=22,lowpass=f=20700," + hifiPreEq +
+        "dynaudnorm=f=180:g=10:p=0.56:m=14:s=20,"
+        "asplit=7[dry][wide][air][bass][glue][depth][spark];"
+        "[wide]highpass=f=120,lowpass=f=14200,"
+        "adelay=0|20,"
+        "aecho=0.34:0.44:24|48|86|132:0.12|0.085|0.052|0.032,"
+        "aphaser=in_gain=0.64:out_gain=0.76:delay=2.4:decay=0.34:speed=0.21,"
+        "pan=stereo|c0=0.94*c0-0.10*c1|c1=-0.10*c0+0.94*c1,"
+        "volume=0.86[wide3d];"
+        "[depth]highpass=f=260,lowpass=f=5800,"
+        "adelay=31|43,"
+        "aecho=0.22:0.31:72|118|176:0.07|0.046|0.028,"
+        "volume=0.42[backdepth];"
+        "[air]highpass=f=3900,adelay=13|0,"
+        "aecho=0.24:0.35:38|76|124:0.075|0.052|0.032,"
+        "volume=0.56[air3d];"
+        "[spark]highpass=f=7800,"
+        "aphaser=in_gain=0.38:out_gain=0.52:delay=1.1:decay=0.18:speed=0.37,"
+        "volume=0.24[sparkle];"
+        "[bass]lowpass=f=138,"
+        "pan=stereo|c0=0.68*c0+0.32*c1|c1=0.32*c0+0.68*c1,"
+        "acompressor=threshold=0.42:ratio=1.22:attack=18:release=150:makeup=1.06,"
+        "volume=0.96[basscenter];"
+        "[glue]bandpass=f=980:w=3800,acompressor=threshold=0.16:ratio=1.50:attack=16:release=155:makeup=1.34[body];"
+        "[dry][wide3d][backdepth][air3d][sparkle][basscenter][body]amix=inputs=7:weights=0.80 0.32 0.16 0.13 0.07 0.28 0.17:normalize=0,"
+        "acompressor=threshold=0.70:ratio=1.28:attack=7:release=118:makeup=1.02,"
+        "alimiter=limit=0.955:level=disabled,"
+        "aresample=48000:resampler=soxr:precision=30[aout]";
 
     std::ostringstream command;
     command << "ffmpeg -y -hide_banner -loglevel error "
@@ -1451,8 +1465,9 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
     const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
     const int renderThreads = effectiveRenderThreads(config);
     const std::size_t bytesPerFrame = static_cast<std::size_t>(config.width) * static_cast<std::size_t>(config.height) * 3U;
-    const int memorySafeBatch = static_cast<int>(std::clamp<std::size_t>((512U * 1024U * 1024U) / std::max<std::size_t>(1U, bytesPerFrame), 1U, 192U));
-    const int requestedBatch = config.renderBatchFrames > 0 ? config.renderBatchFrames : renderThreads * 3;
+    const std::size_t memoryBudget = static_cast<std::size_t>(config.width >= 3840 || config.height >= 2160 ? 256U : 384U) * 1024U * 1024U;
+    const int memorySafeBatch = static_cast<int>(std::clamp<std::size_t>(memoryBudget / std::max<std::size_t>(1U, bytesPerFrame), 1U, 96U));
+    const int requestedBatch = config.renderBatchFrames > 0 ? config.renderBatchFrames : std::max(1, renderThreads * 2);
     const int batchSize = std::max(1, std::min(requestedBatch, memorySafeBatch));
 
     if (onProgress) {
