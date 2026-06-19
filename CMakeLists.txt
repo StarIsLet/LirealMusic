@@ -55,6 +55,7 @@ set(LIREAL_HEADERS
     include/lireal/lyrics/lrc_parser.hpp
     include/lireal/render/render_config.hpp
     include/lireal/render/video_renderer.hpp
+    include/lireal/render/webgpu_backend.hpp
     include/lireal/system/hardware_profile.hpp
 )
 
@@ -63,6 +64,7 @@ set(LIREAL_SOURCES
     src/lireal/audio/onnx_source_separator.cpp
     src/lireal/lyrics/lrc_parser.cpp
     src/lireal/render/video_renderer.cpp
+    src/lireal/render/webgpu_backend.cpp
     src/lireal/system/hardware_profile.cpp
 )
 

@@ -26,6 +26,9 @@ the Free Software Foundation, either version 3 of the License, or
 - 软件内可设置 CPU 合成线程数，默认自动使用多核心批量合成帧，并可与 NVIDIA NVENC/VAAPI 硬件编码并行工作
 - TUI 会自动检测 CPU 线程、内存、NVIDIA/VAAPI/Vulkan/WebGPU 运行条件，并全局启用 `webgpu` 渲染后端配置，同时推荐最大并发线程、批量帧数和编码器
 - 软件内质量预设：快速预览、标准梦幻、高清 2K、高能发布、4K 超清发布
+- GUI 实时预览与最终导出已分离：预览默认最高 1280×720 / 独立 30FPS，最终导出继续使用选择的 1080p/2K/4K 与导出 FPS
+- 歌词/标题使用 QPainterPath 缓存，减少每帧重复构建中文/萝莉体文字路径的 CPU 开销
+- NVIDIA NVENC/VAAPI 只加速 H.264 编码；如果 WebGPU/Dawn 后端未编译，粒子、频谱、Bloom、光晕等画面合成仍由 CPU/OpenCV/OpenMP 完成
 - 软件内风格预设保存/加载，可复用画面参数、质量参数和歌词布局
 - 软件内歌词布局模板：右侧歌词队列、中央大字歌词、底部卡拉 OK
 - 支持将背景图片、音乐、歌词或输出 MP4 拖拽到窗口自动填充
@@ -37,7 +40,7 @@ the Free Software Foundation, either version 3 of the License, or
 - C++ Hann 窗 + OpenCV DFT 频谱分析、全曲自适应归一化与 64 段平滑频谱驱动
 - 高级音乐驱动：频谱通量、频谱质心、节拍脉冲、drop 强度、色彩情绪曲线
 - 可选 ONNX Runtime 神经网络源分离，支持 Vocals、Drums、Bass、Other、Accompaniment stem 驱动
-- WebGPU 后端已全局设为默认渲染模式；当前实现会优先走 `webgpu` 配置路径，运行库不可用时自动使用兼容合成 + NVENC/VAAPI/CPU 编码回退
+- WebGPU 后端已全局设为默认渲染模式，并新增 `lireal::render::gpu` 后端查询接口与 `assets/shaders/lireal_effects.wgsl` shader 入口；未链接 Dawn/wgpu-native 时会明确报告 `cpu-opencv-webgpu-fallback`，不会把 NVENC 编码误报成 GPU 合成
 - 自动启发式分离 Lead Vocal、Harmony/Crowd、Bass/Kick、Percussion、Air/Reverb 多轨能量
 - 基于声像、宽度、深度、高度的 2.5D 环绕舞台可视化算法
 - OpenCV 内存合成视频画面，并通过 FFmpeg rawvideo 管线直接编码，避免逐帧图片落盘

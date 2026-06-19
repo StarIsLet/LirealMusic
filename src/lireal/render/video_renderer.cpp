@@ -14,6 +14,7 @@
 
 #include "lireal/audio/audio_analyzer.hpp"
 #include "lireal/lyrics/lrc_parser.hpp"
+#include "lireal/render/webgpu_backend.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -36,10 +37,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
+#include <list>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 
 #if LIREAL_HAS_OPENMP
 #include <omp.h>
@@ -71,12 +75,12 @@ RenderConfig makeFastPreviewConfig(RenderConfig config) {
         return config;
     }
 
-    const int maxWidth = std::clamp(config.previewMaxWidth, 480, 1920);
-    const int maxHeight = std::clamp(config.previewMaxHeight, 270, 1080);
+    const int maxWidth = std::clamp(config.previewMaxWidth, 640, 1920);
+    const int maxHeight = std::clamp(config.previewMaxHeight, 360, 1080);
     const double scale = std::min({1.0, maxWidth / static_cast<double>(std::max(1, config.width)), maxHeight / static_cast<double>(std::max(1, config.height))});
     config.width = std::max(320, static_cast<int>(std::round(config.width * scale / 2.0)) * 2);
     config.height = std::max(180, static_cast<int>(std::round(config.height * scale / 2.0)) * 2);
-    config.fps = std::clamp(config.previewFps, 12, std::min(30, std::max(12, config.fps)));
+    config.fps = std::clamp(config.previewFps, 12, std::min(60, std::max(12, config.fps)));
     config.renderBatchFrames = std::max(config.renderBatchFrames, config.fps / 2);
     config.spectrumBarHeight *= 0.62;
     config.glowStrength *= 0.52;
@@ -86,6 +90,84 @@ RenderConfig makeFastPreviewConfig(RenderConfig config) {
     config.enableImpactFlash = false;
     config.enableParticles = false;
     return config;
+}
+
+struct CachedTextPath {
+    QPainterPath path;
+    qreal width = 0.0;
+    qreal ascent = 0.0;
+    qreal descent = 0.0;
+    qreal height = 0.0;
+};
+
+struct TextCacheKey {
+    QString text;
+    QString family;
+    int pixelSize = 0;
+    int weight = 0;
+    bool operator==(const TextCacheKey& other) const {
+        return pixelSize == other.pixelSize && weight == other.weight && family == other.family && text == other.text;
+    }
+};
+
+struct TextCacheKeyHash {
+    std::size_t operator()(const TextCacheKey& key) const noexcept {
+        return qHash(key.text) ^ (qHash(key.family) << 1U) ^ (static_cast<std::size_t>(key.pixelSize) << 16U) ^ static_cast<std::size_t>(key.weight);
+    }
+};
+
+class TextPathCache {
+public:
+    CachedTextPath get(const QString& text, const QFont& font) {
+        TextCacheKey key{text, font.family(), font.pixelSize(), font.weight()};
+        std::scoped_lock lock(mutex_);
+        auto found = cache_.find(key);
+        if (found != cache_.end()) {
+            return found->second;
+        }
+        if (cache_.size() >= maxEntries_) {
+            cache_.erase(order_.front());
+            order_.pop_front();
+        }
+        CachedTextPath value;
+        value.path.addText(QPointF(0.0, 0.0), font, text);
+        const QFontMetricsF metrics(font);
+        value.width = metrics.horizontalAdvance(text);
+        value.ascent = metrics.ascent();
+        value.descent = metrics.descent();
+        value.height = metrics.height();
+        auto [inserted, _] = cache_.emplace(key, value);
+        order_.push_back(std::move(key));
+        return inserted->second;
+    }
+
+private:
+    static constexpr std::size_t maxEntries_ = 768;
+    std::mutex mutex_;
+    std::unordered_map<TextCacheKey, CachedTextPath, TextCacheKeyHash> cache_;
+    std::list<TextCacheKey> order_;
+};
+
+TextPathCache& textPathCache() {
+    static TextPathCache cache;
+    return cache;
+}
+
+void drawCachedTextPath(QPainter& painter, const CachedTextPath& cached, QPointF position, const QColor& fill, const QColor& outline, qreal outlineWidth) {
+    QPainterPath translated = cached.path;
+    translated.translate(position);
+    painter.setPen(QPen(outline, outlineWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(fill);
+    painter.drawPath(translated);
+}
+
+bool shouldUseWebGpuShaders(const RenderConfig& config) {
+#if LIREAL_HAS_WEBGPU
+    return config.renderBackend.find("webgpu") != std::string::npos;
+#else
+    (void)config;
+    return false;
+#endif
 }
 
 void alphaBlend(cv::Mat& dst, const cv::Mat& src, cv::Point topLeft, double alpha) {
@@ -230,20 +312,19 @@ void drawSoftSnow(cv::Mat& frame, double timeSeconds, const cv::Scalar& accent) 
 }
 
 void drawGlowingText(QPainter& painter, QString text, QPointF position, QFont font, const QColor& fill, const QColor& glow, qreal glowWidth) {
-    QPainterPath path;
-    path.addText(position, font, text);
-    painter.setPen(QPen(glow, glowWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    painter.setBrush(fill);
-    painter.drawPath(path);
+    const CachedTextPath cached = textPathCache().get(text, font);
+    drawCachedTextPath(painter, cached, position, fill, glow, glowWidth);
     painter.setPen(Qt::NoPen);
     painter.setBrush(fill);
-    painter.drawPath(path);
+    QPainterPath translated = cached.path;
+    translated.translate(position);
+    painter.drawPath(translated);
 }
 
 void drawHighLightedCuteText(QPainter& painter, QString text, QPointF position, QFont font, const QColor& fill, const QColor& glow, double timeSeconds, qreal glowWidth) {
-    const QFontMetricsF metrics(font);
-    const qreal textWidth = metrics.horizontalAdvance(text);
-    const QRectF bounds(position.x() - textWidth * 0.05, position.y() - metrics.ascent() * 1.05, textWidth * 1.10, metrics.height() * 1.45);
+    const CachedTextPath cached = textPathCache().get(text, font);
+    const qreal textWidth = cached.width;
+    const QRectF bounds(position.x() - textWidth * 0.05, position.y() - cached.ascent * 1.05, textWidth * 1.10, cached.height * 1.45);
     const qreal pulse = 0.5 + 0.5 * std::sin(timeSeconds * 1.8);
     const qreal sweep = std::fmod(timeSeconds * 0.34, 1.0);
 
@@ -254,8 +335,8 @@ void drawHighLightedCuteText(QPainter& painter, QString text, QPointF position, 
     painter.drawRoundedRect(bounds, bounds.height() * 0.45, bounds.height() * 0.45);
     painter.restore();
 
-    QPainterPath path;
-    path.addText(position, font, text);
+    QPainterPath path = cached.path;
+    path.translate(position);
     painter.save();
     painter.setPen(QPen(glow, glowWidth + pulse * 5.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(fill);
@@ -385,11 +466,8 @@ QFont makeLyricFont(int pixelSize, bool active, const std::string& requestedFami
 }
 
 void drawOutlinedText(QPainter& painter, const QString& text, QPointF position, const QFont& font, const QColor& fill, const QColor& outline, qreal outlineWidth) {
-    QPainterPath path;
-    path.addText(position, font, text);
-    painter.setPen(QPen(outline, outlineWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    painter.setBrush(fill);
-    painter.drawPath(path);
+    const CachedTextPath cached = textPathCache().get(text, font);
+    drawCachedTextPath(painter, cached, position, fill, outline, outlineWidth);
 }
 
 QFont fitLyricFont(QString& text, int preferredPixelSize, int minPixelSize, qreal maxWidth, bool active) {
@@ -430,9 +508,9 @@ void drawAnimatedLyricText(
     double lineProgress,
     double energy) {
     QFont font = fitLyricFont(text, preferredPixelSize, minPixelSize, area.width(), active);
-    const QFontMetricsF metrics(font);
-    const qreal textWidth = metrics.horizontalAdvance(text);
-    const qreal baseline = area.center().y() + metrics.ascent() / 2.0 - metrics.descent();
+    const CachedTextPath cached = textPathCache().get(text, font);
+    const qreal textWidth = cached.width;
+    const qreal baseline = area.center().y() + cached.ascent / 2.0 - cached.descent;
     const qreal entrance = active ? std::clamp(lineProgress / 0.22, 0.0, 1.0) : (nextActive ? 0.0 : 1.0);
     const qreal exit = active ? std::clamp((1.0 - lineProgress) / 0.24, 0.0, 1.0) : (previousActive ? 0.0 : 1.0);
     const qreal life = active ? std::min(entrance, exit) : (previousActive || nextActive ? 0.64 : 1.0);
@@ -449,28 +527,28 @@ void drawAnimatedLyricText(
     if (active) {
         painter.save();
         painter.setOpacity(std::clamp(0.14 + energy * 0.18, 0.12, 0.34) * life);
-        QPainterPath glowPath;
-        glowPath.addText(position, font, text);
+        QPainterPath glowPath = cached.path;
+        glowPath.translate(position);
         painter.setPen(QPen(QColor(172, 211, 255, 130), outlineWidth + 12.0 + energy * 10.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         painter.setBrush(Qt::NoBrush);
         painter.drawPath(glowPath);
         painter.restore();
     }
 
-    drawOutlinedText(painter, text, position, font, fill, outline, outlineWidth);
+    drawCachedTextPath(painter, cached, position, fill, outline, outlineWidth);
 
     if (active) {
         const qreal fillWidth = std::clamp(lineProgress, 0.0, 1.0) * textWidth;
         painter.save();
-        painter.setClipRect(QRectF(position.x() - 8.0, position.y() - metrics.ascent() - 8.0, fillWidth + 16.0, metrics.height() + 18.0));
-        drawOutlinedText(painter, text, position, font, QColor(160, 210, 255), QColor(255, 255, 255, 180), outlineWidth * 0.52);
+        painter.setClipRect(QRectF(position.x() - 8.0, position.y() - cached.ascent - 8.0, fillWidth + 16.0, cached.height + 18.0));
+        drawCachedTextPath(painter, cached, position, QColor(160, 210, 255), QColor(255, 255, 255, 180), outlineWidth * 0.52);
         painter.restore();
 
         painter.save();
         const qreal sweepX = position.x() + fillWidth;
         painter.setOpacity(std::clamp(0.22 + energy * 0.28, 0.18, 0.52) * life);
         painter.setPen(QPen(QColor(255, 255, 255, 210), std::max<qreal>(2.0, outlineWidth * 0.42), Qt::SolidLine, Qt::RoundCap));
-        painter.drawLine(QPointF(sweepX, position.y() - metrics.ascent() * 0.78), QPointF(sweepX + 10.0, position.y() + metrics.descent() + 6.0));
+        painter.drawLine(QPointF(sweepX, position.y() - cached.ascent * 0.78), QPointF(sweepX + 10.0, position.y() + cached.descent + 6.0));
         painter.restore();
     }
     painter.restore();
@@ -1349,11 +1427,8 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
         setupProgress.currentFrame = 0;
         setupProgress.totalFrames = totalFrames;
         setupProgress.progress = 0.0;
-        if (config.renderBackend.find("webgpu") != std::string::npos) {
-            setupProgress.message = "WebGPU 全局模式：优先使用 WebGPU 路径，不可用时兼容合成 + GPU 编码回退";
-        } else {
-            setupProgress.message = "使用 CPU/OpenMP 合成 + 自动编码器";
-        }
+        const auto gpuStatus = gpu::queryWebGpuBackend(config);
+        setupProgress.message = gpuStatus.message;
         onProgress(setupProgress);
     }
 

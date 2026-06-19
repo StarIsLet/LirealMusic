@@ -633,7 +633,9 @@ void DashboardWindow::startRender() {
     renderTimer_.restart();
     appendLog(QStringLiteral("开始渲染：%1").arg(QString::fromStdString(config.outputVideoPath.string())));
     appendLog(QStringLiteral("录制模式：已启用预览窗口，编码器直接录制同一份 %1×%2 原始合成帧，不走屏幕截图压缩。").arg(config.width).arg(config.height));
-    appendLog(QStringLiteral("性能模式：WebGPU 全局渲染=%1，并发线程=%2，NVIDIA/VAAPI 可用于并行硬件编码。").arg(QString::fromStdString(config.renderBackend)).arg(config.renderThreads <= 0 ? QStringLiteral("自动") : QString::number(config.renderThreads)));
+    appendLog(QStringLiteral("性能模式：合成后端=%1，并发线程=%2；NVENC/VAAPI 只加速 H.264 编码，画面合成需 WebGPU/Dawn 后端或 CPU/OpenMP。")
+        .arg(QString::fromStdString(config.renderBackend))
+        .arg(config.renderThreads <= 0 ? QStringLiteral("自动") : QString::number(config.renderThreads)));
 
     auto* recordDialog = new QDialog(this);
     recordDialog->setAttribute(Qt::WA_DeleteOnClose, true);
@@ -905,7 +907,7 @@ void DashboardWindow::generatePreview() {
     cancelButton_->setEnabled(false);
     progressBar_->setValue(0);
     renderTimer_.restart();
-    appendLog(QStringLiteral("打开极速实时预览：从 %1 秒开始播放 %2 秒，导出源为 %3×%4，预览会自动降采样到最多 960×540 / 30FPS。")
+    appendLog(QStringLiteral("打开极速实时预览：从 %1 秒开始播放 %2 秒，导出源为 %3×%4，预览会自动降采样到最多 1280×720 / 独立 30FPS。")
         .arg(previewTimeSeconds, 0, 'f', 1)
         .arg(previewDurationSeconds, 0, 'f', 1)
         .arg(config.width)
@@ -914,7 +916,7 @@ void DashboardWindow::generatePreview() {
     auto future = QtConcurrent::run([this, config, previewTimeSeconds, dialogGuard, labelGuard, audioPanelGuard, cancelPreview]() {
         try {
             lireal::render::VideoRenderer renderer;
-            renderer.renderPreviewStream(config, previewTimeSeconds, 12.0, [this, dialogGuard, labelGuard, audioPanelGuard, cancelPreview, fps = config.fps](const QImage& image, int current, int total, const lireal::audio::AudioFrameEnergy& energy) {
+            renderer.renderPreviewStream(config, previewTimeSeconds, 12.0, [this, dialogGuard, labelGuard, audioPanelGuard, cancelPreview, previewFps = std::clamp(config.previewFps, 12, 60)](const QImage& image, int current, int total, const lireal::audio::AudioFrameEnergy& energy) {
                 if (cancelPreview->load()) {
                     return;
                 }
@@ -928,7 +930,7 @@ void DashboardWindow::generatePreview() {
                     }
                     progressBar_->setValue(static_cast<int>((static_cast<double>(current) / static_cast<double>(total)) * 1000.0));
                 }, Qt::QueuedConnection);
-                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1, 1000 / std::max(1, fps))));
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1, 1000 / std::max(1, previewFps))));
             }, [cancelPreview]() {
                 return cancelPreview->load();
             });
