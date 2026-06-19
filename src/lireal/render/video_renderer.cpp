@@ -153,6 +153,36 @@ TextPathCache& textPathCache() {
     return cache;
 }
 
+CachedTextPath cachedTextPath(const QString& text, const QFont& font) {
+    struct HotEntry {
+        QString text;
+        QString family;
+        int pixelSize = 0;
+        int weight = 0;
+        CachedTextPath value;
+        bool valid = false;
+    };
+    thread_local std::array<HotEntry, 16> hotEntries;
+    const int pixelSize = font.pixelSize();
+    const int weight = font.weight();
+    const QString family = font.family();
+    for (const HotEntry& entry : hotEntries) {
+        if (entry.valid && entry.pixelSize == pixelSize && entry.weight == weight && entry.family == family && entry.text == text) {
+            return entry.value;
+        }
+    }
+    static thread_local std::size_t cursor = 0;
+    CachedTextPath value = textPathCache().get(text, font);
+    HotEntry& slot = hotEntries[cursor++ % hotEntries.size()];
+    slot.text = text;
+    slot.family = family;
+    slot.pixelSize = pixelSize;
+    slot.weight = weight;
+    slot.value = value;
+    slot.valid = true;
+    return value;
+}
+
 void drawCachedTextPath(QPainter& painter, const CachedTextPath& cached, QPointF position, const QColor& fill, const QColor& outline, qreal outlineWidth) {
     QPainterPath translated = cached.path;
     translated.translate(position);
@@ -312,7 +342,7 @@ void drawSoftSnow(cv::Mat& frame, double timeSeconds, const cv::Scalar& accent) 
 }
 
 void drawGlowingText(QPainter& painter, QString text, QPointF position, QFont font, const QColor& fill, const QColor& glow, qreal glowWidth) {
-    const CachedTextPath cached = textPathCache().get(text, font);
+    const CachedTextPath cached = cachedTextPath(text, font);
     drawCachedTextPath(painter, cached, position, fill, glow, glowWidth);
     painter.setPen(Qt::NoPen);
     painter.setBrush(fill);
@@ -322,7 +352,7 @@ void drawGlowingText(QPainter& painter, QString text, QPointF position, QFont fo
 }
 
 void drawHighLightedCuteText(QPainter& painter, QString text, QPointF position, QFont font, const QColor& fill, const QColor& glow, double timeSeconds, qreal glowWidth) {
-    const CachedTextPath cached = textPathCache().get(text, font);
+    const CachedTextPath cached = cachedTextPath(text, font);
     const qreal textWidth = cached.width;
     const QRectF bounds(position.x() - textWidth * 0.05, position.y() - cached.ascent * 1.05, textWidth * 1.10, cached.height * 1.45);
     const qreal pulse = 0.5 + 0.5 * std::sin(timeSeconds * 1.8);
@@ -466,7 +496,7 @@ QFont makeLyricFont(int pixelSize, bool active, const std::string& requestedFami
 }
 
 void drawOutlinedText(QPainter& painter, const QString& text, QPointF position, const QFont& font, const QColor& fill, const QColor& outline, qreal outlineWidth) {
-    const CachedTextPath cached = textPathCache().get(text, font);
+    const CachedTextPath cached = cachedTextPath(text, font);
     drawCachedTextPath(painter, cached, position, fill, outline, outlineWidth);
 }
 
@@ -508,7 +538,7 @@ void drawAnimatedLyricText(
     double lineProgress,
     double energy) {
     QFont font = fitLyricFont(text, preferredPixelSize, minPixelSize, area.width(), active);
-    const CachedTextPath cached = textPathCache().get(text, font);
+    const CachedTextPath cached = cachedTextPath(text, font);
     const qreal textWidth = cached.width;
     const qreal baseline = area.center().y() + cached.ascent / 2.0 - cached.descent;
     const qreal entrance = active ? std::clamp(lineProgress / 0.22, 0.0, 1.0) : (nextActive ? 0.0 : 1.0);
@@ -1309,6 +1339,9 @@ cv::Mat composeFrame(
     const RenderConfig& config,
     const cv::Mat& base,
     const cv::Mat& circleCover,
+    const cv::Scalar& accent,
+    const cv::Mat& coolWash,
+    const cv::Mat& airyShadow,
     const std::vector<lyrics::LyricLine>& lyricLines,
     const audio::AudioFrameEnergy& energy,
     double timeSeconds,
@@ -1327,10 +1360,7 @@ cv::Mat composeFrame(
     cv::Mat frame;
     cv::warpAffine(base, frame, transform, base.size(), fastPreview ? cv::INTER_LINEAR : cv::INTER_CUBIC, cv::BORDER_REFLECT101);
 
-    const cv::Scalar accent = estimateLightAccentColor(base);
-    cv::Mat coolWash(frame.size(), frame.type(), cv::Scalar(accent[0], accent[1], accent[2]));
     cv::addWeighted(coolWash, fastPreview ? 0.13 : 0.18, frame, fastPreview ? 0.87 : 0.82, 0.0, frame);
-    cv::Mat airyShadow(frame.size(), frame.type(), cv::Scalar(58, 62, 70));
     cv::addWeighted(airyShadow, fastPreview ? 0.10 : 0.16, frame, fastPreview ? 0.90 : 0.84, 0.0, frame);
     if (!fastPreview) {
         drawSoftSnow(frame, timeSeconds, cv::Scalar(255, 255, 255));
@@ -1414,6 +1444,9 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
     }
 
     const cv::Mat base = coverResize(background, config.width, config.height);
+    const cv::Scalar accent = estimateLightAccentColor(base);
+    const cv::Mat coolWash(base.size(), base.type(), cv::Scalar(accent[0], accent[1], accent[2]));
+    const cv::Mat airyShadow(base.size(), base.type(), cv::Scalar(58, 62, 70));
     const int coverDiameter = static_cast<int>(std::min(config.width, config.height) * 0.28);
     const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
     const int renderThreads = effectiveRenderThreads(config);
@@ -1451,7 +1484,7 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
             const int frameIndex = batchStart + localIndex;
             const double t = static_cast<double>(frameIndex) / static_cast<double>(config.fps);
             const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
-            frames[static_cast<std::size_t>(localIndex)] = composeFrame(config, base, circleCover, lyricLines, energy, t, frameIndex, totalFrames);
+            frames[static_cast<std::size_t>(localIndex)] = composeFrame(config, base, circleCover, accent, coolWash, airyShadow, lyricLines, energy, t, frameIndex, totalFrames);
         }
 
         for (int localIndex = 0; localIndex < currentBatchSize; ++localIndex) {
@@ -1464,7 +1497,8 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
 
             const int frameIndex = batchStart + localIndex;
             cv::Mat frame = frames[static_cast<std::size_t>(localIndex)];
-            if (onPreviewFrame && (frameIndex % std::max(1, config.fps / 6) == 0 || frameIndex + 1 == totalFrames)) {
+            const int previewStride = std::max(1, config.fps / 3);
+            if (onPreviewFrame && (frameIndex % previewStride == 0 || frameIndex + 1 == totalFrames)) {
                 cv::Mat previewFrame = frame;
                 const int maxPreviewWidth = std::clamp(config.previewMaxWidth, 480, 1920);
                 const int maxPreviewHeight = std::clamp(config.previewMaxHeight, 270, 1080);
@@ -1472,9 +1506,7 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
                 if (previewScale < 0.999) {
                     cv::resize(frame, previewFrame, {}, previewScale, previewScale, cv::INTER_AREA);
                 }
-                cv::Mat rgb;
-                cv::cvtColor(previewFrame, rgb, cv::COLOR_BGR2RGB);
-                QImage image(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
+                QImage image(previewFrame.data, previewFrame.cols, previewFrame.rows, static_cast<int>(previewFrame.step), QImage::Format_BGR888);
                 const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
                 onPreviewFrame(image.copy(), frameIndex + 1, totalFrames, energy);
             }
@@ -1546,10 +1578,13 @@ void VideoRenderer::renderPreviewImage(const RenderConfig& config, const std::fi
     const int frameIndex = std::clamp(static_cast<int>(previewTime * previewConfig.fps), 0, totalFrames - 1);
 
     const cv::Mat base = coverResize(background, previewConfig.width, previewConfig.height);
+    const cv::Scalar accent = estimateLightAccentColor(base);
+    const cv::Mat coolWash(base.size(), base.type(), cv::Scalar(accent[0], accent[1], accent[2]));
+    const cv::Mat airyShadow(base.size(), base.type(), cv::Scalar(58, 62, 70));
     const int coverDiameter = static_cast<int>(std::min(previewConfig.width, previewConfig.height) * 0.28);
     const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
     const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
-    cv::Mat frame = composeFrame(previewConfig, base, circleCover, lyricLines, energy, previewTime, frameIndex, totalFrames, previewConfig.enableFastPreview);
+    cv::Mat frame = composeFrame(previewConfig, base, circleCover, accent, coolWash, airyShadow, lyricLines, energy, previewTime, frameIndex, totalFrames, previewConfig.enableFastPreview);
 
     std::filesystem::create_directories(previewPath.parent_path());
     if (!cv::imwrite(previewPath.string(), frame)) {
@@ -1578,6 +1613,9 @@ void VideoRenderer::renderPreviewStream(const RenderConfig& config, double start
     const std::vector<lyrics::LyricLine> lyricLines = parser.parse(previewConfig.lyricPath);
 
     const cv::Mat base = coverResize(background, previewConfig.width, previewConfig.height);
+    const cv::Scalar accent = estimateLightAccentColor(base);
+    const cv::Mat coolWash(base.size(), base.type(), cv::Scalar(accent[0], accent[1], accent[2]));
+    const cv::Mat airyShadow(base.size(), base.type(), cv::Scalar(58, 62, 70));
     const int coverDiameter = static_cast<int>(std::min(previewConfig.width, previewConfig.height) * 0.28);
     const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
     const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * previewConfig.fps)));
@@ -1592,10 +1630,8 @@ void VideoRenderer::renderPreviewStream(const RenderConfig& config, double start
         const double timeSeconds = std::min(analysis.durationSeconds, safeStart + static_cast<double>(previewIndex) / static_cast<double>(previewConfig.fps));
         const int frameIndex = std::clamp(static_cast<int>(timeSeconds * previewConfig.fps), 0, totalFrames - 1);
         const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
-        cv::Mat frame = composeFrame(previewConfig, base, circleCover, lyricLines, energy, timeSeconds, frameIndex, totalFrames, previewConfig.enableFastPreview);
-        cv::Mat rgb;
-        cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
-        QImage image(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
+        cv::Mat frame = composeFrame(previewConfig, base, circleCover, accent, coolWash, airyShadow, lyricLines, energy, timeSeconds, frameIndex, totalFrames, previewConfig.enableFastPreview);
+        QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
         onFrame(image.copy(), previewIndex + 1, previewFrames, energy);
     }
 }
