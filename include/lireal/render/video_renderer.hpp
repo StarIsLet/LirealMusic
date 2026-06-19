@@ -46,6 +46,12 @@ public:
     // 快速生成单张预览图，便于在完整渲染前确认当前风格参数。
     void renderPreviewImage(const RenderConfig& config, const std::filesystem::path& previewPath, double preferredTimeSeconds = 12.0) const;
 
+    // 播放器模式第一阶段：先解码并分析音频，供后续画面循环复用。
+    audio::AudioAnalysisResult analyzePreviewAudio(const RenderConfig& config) const;
+
+    // 播放器模式第二阶段：使用已预处理好的音频驱动画面循环，不重复解码音乐。
+    void renderPreviewStreamFromAnalysis(const RenderConfig& config, const audio::AudioAnalysisResult& analysis, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel = {}) const;
+
     // 在内存中连续合成预览帧并回调给界面窗口，不写入任何中间帧文件。
     void renderPreviewStream(const RenderConfig& config, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel = {}) const;
 };

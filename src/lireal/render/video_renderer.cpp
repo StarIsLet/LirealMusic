@@ -1442,8 +1442,16 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
         throw std::runtime_error("无法读取背景图片: " + config.backgroundImagePath.string());
     }
 
+    if (onProgress) {
+        onProgress({0, 1, 0.0, "先处理音频：解码、重采样、分轨和频谱分析"});
+    }
+
     audio::AudioAnalyzer analyzer;
     const audio::AudioAnalysisResult analysis = analyzer.analyze(config.musicPath, config.fps);
+
+    if (onProgress) {
+        onProgress({0, 1, 0.0, "音频处理完成，正在解析歌词并准备视频流水线"});
+    }
 
     lyrics::LrcParser parser;
     const std::vector<lyrics::LyricLine> lyricLines = parser.parse(config.lyricPath);
@@ -1607,21 +1615,32 @@ void VideoRenderer::renderPreviewImage(const RenderConfig& config, const std::fi
     }
 }
 
-void VideoRenderer::renderPreviewStream(const RenderConfig& config, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel) const {
+audio::AudioAnalysisResult VideoRenderer::analyzePreviewAudio(const RenderConfig& config) const {
     const RenderConfig previewConfig = makeFastPreviewConfig(config);
-    if (previewConfig.backgroundImagePath.empty() || previewConfig.musicPath.empty() || previewConfig.lyricPath.empty()) {
-        throw std::runtime_error("背景、音乐、歌词都必须选择后才能打开实时预览");
+    if (previewConfig.musicPath.empty()) {
+        throw std::runtime_error("必须选择音乐后才能预处理播放器音频");
+    }
+
+    audio::AudioAnalyzer analyzer;
+    auto analysis = analyzer.analyze(previewConfig.musicPath, previewConfig.fps);
+    if (analysis.frames.empty()) {
+        throw std::runtime_error("无法从音乐中生成预览驱动数据");
+    }
+    return analysis;
+}
+
+void VideoRenderer::renderPreviewStreamFromAnalysis(const RenderConfig& config, const audio::AudioAnalysisResult& analysis, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel) const {
+    const RenderConfig previewConfig = makeFastPreviewConfig(config);
+    if (previewConfig.backgroundImagePath.empty() || previewConfig.lyricPath.empty()) {
+        throw std::runtime_error("背景和歌词都必须选择后才能打开播放器预览");
+    }
+    if (analysis.frames.empty()) {
+        throw std::runtime_error("播放器预览缺少已预处理的音频驱动数据");
     }
 
     cv::Mat background = cv::imread(previewConfig.backgroundImagePath.string(), cv::IMREAD_COLOR);
     if (background.empty()) {
         throw std::runtime_error("无法读取背景图片: " + previewConfig.backgroundImagePath.string());
-    }
-
-    audio::AudioAnalyzer analyzer;
-    const audio::AudioAnalysisResult analysis = analyzer.analyze(previewConfig.musicPath, previewConfig.fps);
-    if (analysis.frames.empty()) {
-        throw std::runtime_error("无法从音乐中生成预览驱动数据");
     }
 
     lyrics::LrcParser parser;
@@ -1635,7 +1654,8 @@ void VideoRenderer::renderPreviewStream(const RenderConfig& config, double start
     const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
     const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * previewConfig.fps)));
     const double safeStart = std::clamp(startSeconds, 0.0, std::max(0.0, analysis.durationSeconds - 0.05));
-    const double safeDuration = std::clamp(durationSeconds, 0.5, std::max(0.5, analysis.durationSeconds - safeStart));
+    const double remainingDuration = std::max(0.5, analysis.durationSeconds - safeStart);
+    const double safeDuration = durationSeconds <= 0.0 ? remainingDuration : std::clamp(durationSeconds, 0.5, remainingDuration);
     const int previewFrames = std::max(1, static_cast<int>(std::ceil(safeDuration * previewConfig.fps)));
 
     for (int previewIndex = 0; previewIndex < previewFrames; ++previewIndex) {
@@ -1649,6 +1669,16 @@ void VideoRenderer::renderPreviewStream(const RenderConfig& config, double start
         QImage image(frame.data, frame.cols, frame.rows, static_cast<int>(frame.step), QImage::Format_BGR888);
         onFrame(image.copy(), previewIndex + 1, previewFrames, energy);
     }
+}
+
+void VideoRenderer::renderPreviewStream(const RenderConfig& config, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel) const {
+    const RenderConfig previewConfig = makeFastPreviewConfig(config);
+    if (previewConfig.backgroundImagePath.empty() || previewConfig.musicPath.empty() || previewConfig.lyricPath.empty()) {
+        throw std::runtime_error("背景、音乐、歌词都必须选择后才能打开实时预览");
+    }
+
+    const audio::AudioAnalysisResult analysis = analyzePreviewAudio(config);
+    renderPreviewStreamFromAnalysis(config, analysis, startSeconds, durationSeconds, onFrame, shouldCancel);
 }
 
 } // namespace lireal::render
