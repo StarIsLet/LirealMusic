@@ -905,7 +905,7 @@ void DashboardWindow::generatePreview() {
     cancelButton_->setEnabled(false);
     progressBar_->setValue(0);
     renderTimer_.restart();
-    appendLog(QStringLiteral("打开实时预览：从 %1 秒开始播放 %2 秒，源帧为 %3×%4。")
+    appendLog(QStringLiteral("打开极速实时预览：从 %1 秒开始播放 %2 秒，导出源为 %3×%4，预览会自动降采样到最多 960×540 / 30FPS。")
         .arg(previewTimeSeconds, 0, 'f', 1)
         .arg(previewDurationSeconds, 0, 'f', 1)
         .arg(config.width)

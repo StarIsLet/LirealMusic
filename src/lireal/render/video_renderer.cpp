@@ -66,6 +66,28 @@ cv::Mat makeCircularImage(const cv::Mat& source, int diameter) {
     return result;
 }
 
+RenderConfig makeFastPreviewConfig(RenderConfig config) {
+    if (!config.enableFastPreview) {
+        return config;
+    }
+
+    const int maxWidth = std::clamp(config.previewMaxWidth, 480, 1920);
+    const int maxHeight = std::clamp(config.previewMaxHeight, 270, 1080);
+    const double scale = std::min({1.0, maxWidth / static_cast<double>(std::max(1, config.width)), maxHeight / static_cast<double>(std::max(1, config.height))});
+    config.width = std::max(320, static_cast<int>(std::round(config.width * scale / 2.0)) * 2);
+    config.height = std::max(180, static_cast<int>(std::round(config.height * scale / 2.0)) * 2);
+    config.fps = std::clamp(config.previewFps, 12, std::min(30, std::max(12, config.fps)));
+    config.renderBatchFrames = std::max(config.renderBatchFrames, config.fps / 2);
+    config.spectrumBarHeight *= 0.62;
+    config.glowStrength *= 0.52;
+    config.parallaxStrength *= 0.72;
+    config.enableBloom = false;
+    config.enableMangaFilter = false;
+    config.enableImpactFlash = false;
+    config.enableParticles = false;
+    return config;
+}
+
 void alphaBlend(cv::Mat& dst, const cv::Mat& src, cv::Point topLeft, double alpha) {
     const cv::Rect dstRect(0, 0, dst.cols, dst.rows);
     const cv::Rect srcRect(topLeft.x, topLeft.y, src.cols, src.rows);
@@ -1213,27 +1235,30 @@ cv::Mat composeFrame(
     const audio::AudioFrameEnergy& energy,
     double timeSeconds,
     int frameIndex,
-    int totalFrames) {
+    int totalFrames,
+    bool fastPreview = false) {
     const double dx = std::sin(timeSeconds * 0.22) * config.parallaxStrength * 0.16;
     const double dy = std::cos(timeSeconds * 0.18) * config.parallaxStrength * 0.10;
-    const double roll = std::sin(timeSeconds * 0.16) * 0.18;
-    const double scale = 1.035 + energy.bass * config.pulseStrength * 0.42;
+    const double roll = std::sin(timeSeconds * 0.16) * (fastPreview ? 0.08 : 0.18);
+    const double scale = 1.025 + energy.bass * config.pulseStrength * (fastPreview ? 0.24 : 0.42);
     const cv::Point2f center(static_cast<float>(config.width) * 0.5F, static_cast<float>(config.height) * 0.5F);
     cv::Mat transform = cv::getRotationMatrix2D(center, roll, scale);
     transform.at<double>(0, 2) += dx;
     transform.at<double>(1, 2) += dy;
 
     cv::Mat frame;
-    cv::warpAffine(base, frame, transform, base.size(), cv::INTER_CUBIC, cv::BORDER_REFLECT101);
+    cv::warpAffine(base, frame, transform, base.size(), fastPreview ? cv::INTER_LINEAR : cv::INTER_CUBIC, cv::BORDER_REFLECT101);
 
     const cv::Scalar accent = estimateLightAccentColor(base);
     cv::Mat coolWash(frame.size(), frame.type(), cv::Scalar(accent[0], accent[1], accent[2]));
-    cv::addWeighted(coolWash, 0.18, frame, 0.82, 0.0, frame);
+    cv::addWeighted(coolWash, fastPreview ? 0.13 : 0.18, frame, fastPreview ? 0.87 : 0.82, 0.0, frame);
     cv::Mat airyShadow(frame.size(), frame.type(), cv::Scalar(58, 62, 70));
-    cv::addWeighted(airyShadow, 0.16, frame, 0.84, 0.0, frame);
-    drawSoftSnow(frame, timeSeconds, cv::Scalar(255, 255, 255));
-    drawAuroraRibbons(frame, energy, timeSeconds);
-    drawSurroundStage(frame, energy, timeSeconds);
+    cv::addWeighted(airyShadow, fastPreview ? 0.10 : 0.16, frame, fastPreview ? 0.90 : 0.84, 0.0, frame);
+    if (!fastPreview) {
+        drawSoftSnow(frame, timeSeconds, cv::Scalar(255, 255, 255));
+        drawAuroraRibbons(frame, energy, timeSeconds);
+        drawSurroundStage(frame, energy, timeSeconds);
+    }
     drawSongInfo(frame, config, accent, timeSeconds);
     drawWatermark(frame, config);
 
@@ -1241,8 +1266,10 @@ cv::Mat composeFrame(
     const cv::Point coverCenter(static_cast<int>(config.width * 0.27), static_cast<int>(config.height * 0.57));
     const int blackRingRadius = coverDiameter / 2 + static_cast<int>(std::min(config.width, config.height) * 0.036);
     const int spectrumRadius = blackRingRadius + static_cast<int>(std::min(config.width, config.height) * 0.022);
-    drawBassHalo(frame, energy, coverCenter, spectrumRadius);
-    drawSpectrumRing(frame, energy.spectrumBins, coverCenter, spectrumRadius, config.spectrumBarHeight * 0.58, cv::Scalar(255, 255, 255));
+    if (!fastPreview) {
+        drawBassHalo(frame, energy, coverCenter, spectrumRadius);
+    }
+    drawSpectrumRing(frame, energy.spectrumBins, coverCenter, spectrumRadius, config.spectrumBarHeight * (fastPreview ? 0.40 : 0.58), cv::Scalar(255, 255, 255));
 
     if (config.enableCircularCover) {
         cv::circle(frame, coverCenter, blackRingRadius, cv::Scalar(0, 0, 0), cv::FILLED, cv::LINE_AA);
@@ -1251,14 +1278,24 @@ cv::Mat composeFrame(
     }
 
     drawLyricsByLayout(frame, lyricLines, timeSeconds, energy.rms, config.lyricLayoutMode);
-    drawParticles(frame, timeSeconds, std::max(energy.rms, energy.beatPulse));
-    drawAudioComets(frame, energy, timeSeconds);
-    drawBeatShockwaves(frame, energy, timeSeconds);
-    drawStarbursts(frame, energy, timeSeconds);
-    addImpactFlash(frame, energy.dropIntensity);
-    addBloom(frame, 0.045 + energy.ambience * 0.030 + energy.beatPulse * 0.050);
-    applyNeuralColorGrade(frame, energy, timeSeconds);
-    applyDreamGrade(frame, timeSeconds, std::max(energy.rms, energy.dropIntensity));
+    if (!fastPreview) {
+        if (config.enableParticles) {
+            drawParticles(frame, timeSeconds, std::max(energy.rms, energy.beatPulse));
+        }
+        drawAudioComets(frame, energy, timeSeconds);
+        drawBeatShockwaves(frame, energy, timeSeconds);
+        drawStarbursts(frame, energy, timeSeconds);
+        if (config.enableImpactFlash) {
+            addImpactFlash(frame, energy.dropIntensity);
+        }
+        if (config.enableBloom) {
+            addBloom(frame, 0.045 + energy.ambience * 0.030 + energy.beatPulse * 0.050);
+        }
+        applyNeuralColorGrade(frame, energy, timeSeconds);
+        applyDreamGrade(frame, timeSeconds, std::max(energy.rms, energy.dropIntensity));
+    } else {
+        applyNeuralColorGrade(frame, energy, timeSeconds);
+    }
 
     const int progressY = std::max(0, config.height - 5);
     cv::line(frame, {0, progressY}, {static_cast<int>(config.width * (static_cast<double>(frameIndex) / totalFrames)), progressY}, cv::Scalar(188, 112, 255), 5, cv::LINE_AA);
@@ -1353,8 +1390,15 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
             const int frameIndex = batchStart + localIndex;
             cv::Mat frame = frames[static_cast<std::size_t>(localIndex)];
             if (onPreviewFrame && (frameIndex % std::max(1, config.fps / 6) == 0 || frameIndex + 1 == totalFrames)) {
+                cv::Mat previewFrame = frame;
+                const int maxPreviewWidth = std::clamp(config.previewMaxWidth, 480, 1920);
+                const int maxPreviewHeight = std::clamp(config.previewMaxHeight, 270, 1080);
+                const double previewScale = std::min({1.0, maxPreviewWidth / static_cast<double>(std::max(1, frame.cols)), maxPreviewHeight / static_cast<double>(std::max(1, frame.rows))});
+                if (previewScale < 0.999) {
+                    cv::resize(frame, previewFrame, {}, previewScale, previewScale, cv::INTER_AREA);
+                }
                 cv::Mat rgb;
-                cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
+                cv::cvtColor(previewFrame, rgb, cv::COLOR_BGR2RGB);
                 QImage image(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);
                 const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
                 onPreviewFrame(image.copy(), frameIndex + 1, totalFrames, energy);
@@ -1384,7 +1428,7 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
     }
 
     if (onProgress) {
-        onProgress({totalFrames, totalFrames, 0.985, "正在合并原始音乐音轨"});
+        onProgress({totalFrames, totalFrames, 0.985, "正在合并 HiFi 双声道 3D 环绕音轨"});
     }
 
     if (shouldCancel && shouldCancel()) {
@@ -1403,33 +1447,34 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
 }
 
 void VideoRenderer::renderPreviewImage(const RenderConfig& config, const std::filesystem::path& previewPath, double preferredTimeSeconds) const {
-    if (config.backgroundImagePath.empty() || config.musicPath.empty() || config.lyricPath.empty()) {
+    const RenderConfig previewConfig = makeFastPreviewConfig(config);
+    if (previewConfig.backgroundImagePath.empty() || previewConfig.musicPath.empty() || previewConfig.lyricPath.empty()) {
         throw std::runtime_error("背景、音乐、歌词都必须选择后才能生成预览图");
     }
 
-    cv::Mat background = cv::imread(config.backgroundImagePath.string(), cv::IMREAD_COLOR);
+    cv::Mat background = cv::imread(previewConfig.backgroundImagePath.string(), cv::IMREAD_COLOR);
     if (background.empty()) {
-        throw std::runtime_error("无法读取背景图片: " + config.backgroundImagePath.string());
+        throw std::runtime_error("无法读取背景图片: " + previewConfig.backgroundImagePath.string());
     }
 
     audio::AudioAnalyzer analyzer;
-    const audio::AudioAnalysisResult analysis = analyzer.analyze(config.musicPath, config.fps);
+    const audio::AudioAnalysisResult analysis = analyzer.analyze(previewConfig.musicPath, previewConfig.fps);
     if (analysis.frames.empty()) {
         throw std::runtime_error("无法从音乐中生成预览驱动数据");
     }
 
     lyrics::LrcParser parser;
-    const std::vector<lyrics::LyricLine> lyricLines = parser.parse(config.lyricPath);
+    const std::vector<lyrics::LyricLine> lyricLines = parser.parse(previewConfig.lyricPath);
 
-    const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * config.fps)));
+    const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * previewConfig.fps)));
     const double previewTime = std::clamp(preferredTimeSeconds, 0.0, std::max(0.0, analysis.durationSeconds - 0.05));
-    const int frameIndex = std::clamp(static_cast<int>(previewTime * config.fps), 0, totalFrames - 1);
+    const int frameIndex = std::clamp(static_cast<int>(previewTime * previewConfig.fps), 0, totalFrames - 1);
 
-    const cv::Mat base = coverResize(background, config.width, config.height);
-    const int coverDiameter = static_cast<int>(std::min(config.width, config.height) * 0.28);
+    const cv::Mat base = coverResize(background, previewConfig.width, previewConfig.height);
+    const int coverDiameter = static_cast<int>(std::min(previewConfig.width, previewConfig.height) * 0.28);
     const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
     const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
-    cv::Mat frame = composeFrame(config, base, circleCover, lyricLines, energy, previewTime, frameIndex, totalFrames);
+    cv::Mat frame = composeFrame(previewConfig, base, circleCover, lyricLines, energy, previewTime, frameIndex, totalFrames, previewConfig.enableFastPreview);
 
     std::filesystem::create_directories(previewPath.parent_path());
     if (!cv::imwrite(previewPath.string(), frame)) {
@@ -1438,40 +1483,41 @@ void VideoRenderer::renderPreviewImage(const RenderConfig& config, const std::fi
 }
 
 void VideoRenderer::renderPreviewStream(const RenderConfig& config, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel) const {
-    if (config.backgroundImagePath.empty() || config.musicPath.empty() || config.lyricPath.empty()) {
+    const RenderConfig previewConfig = makeFastPreviewConfig(config);
+    if (previewConfig.backgroundImagePath.empty() || previewConfig.musicPath.empty() || previewConfig.lyricPath.empty()) {
         throw std::runtime_error("背景、音乐、歌词都必须选择后才能打开实时预览");
     }
 
-    cv::Mat background = cv::imread(config.backgroundImagePath.string(), cv::IMREAD_COLOR);
+    cv::Mat background = cv::imread(previewConfig.backgroundImagePath.string(), cv::IMREAD_COLOR);
     if (background.empty()) {
-        throw std::runtime_error("无法读取背景图片: " + config.backgroundImagePath.string());
+        throw std::runtime_error("无法读取背景图片: " + previewConfig.backgroundImagePath.string());
     }
 
     audio::AudioAnalyzer analyzer;
-    const audio::AudioAnalysisResult analysis = analyzer.analyze(config.musicPath, config.fps);
+    const audio::AudioAnalysisResult analysis = analyzer.analyze(previewConfig.musicPath, previewConfig.fps);
     if (analysis.frames.empty()) {
         throw std::runtime_error("无法从音乐中生成预览驱动数据");
     }
 
     lyrics::LrcParser parser;
-    const std::vector<lyrics::LyricLine> lyricLines = parser.parse(config.lyricPath);
+    const std::vector<lyrics::LyricLine> lyricLines = parser.parse(previewConfig.lyricPath);
 
-    const cv::Mat base = coverResize(background, config.width, config.height);
-    const int coverDiameter = static_cast<int>(std::min(config.width, config.height) * 0.28);
+    const cv::Mat base = coverResize(background, previewConfig.width, previewConfig.height);
+    const int coverDiameter = static_cast<int>(std::min(previewConfig.width, previewConfig.height) * 0.28);
     const cv::Mat circleCover = makeCircularImage(background, coverDiameter);
-    const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * config.fps)));
+    const int totalFrames = std::max(1, static_cast<int>(std::ceil(analysis.durationSeconds * previewConfig.fps)));
     const double safeStart = std::clamp(startSeconds, 0.0, std::max(0.0, analysis.durationSeconds - 0.05));
     const double safeDuration = std::clamp(durationSeconds, 0.5, std::max(0.5, analysis.durationSeconds - safeStart));
-    const int previewFrames = std::max(1, static_cast<int>(std::ceil(safeDuration * config.fps)));
+    const int previewFrames = std::max(1, static_cast<int>(std::ceil(safeDuration * previewConfig.fps)));
 
     for (int previewIndex = 0; previewIndex < previewFrames; ++previewIndex) {
         if (shouldCancel && shouldCancel()) {
             return;
         }
-        const double timeSeconds = std::min(analysis.durationSeconds, safeStart + static_cast<double>(previewIndex) / static_cast<double>(config.fps));
-        const int frameIndex = std::clamp(static_cast<int>(timeSeconds * config.fps), 0, totalFrames - 1);
+        const double timeSeconds = std::min(analysis.durationSeconds, safeStart + static_cast<double>(previewIndex) / static_cast<double>(previewConfig.fps));
+        const int frameIndex = std::clamp(static_cast<int>(timeSeconds * previewConfig.fps), 0, totalFrames - 1);
         const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
-        cv::Mat frame = composeFrame(config, base, circleCover, lyricLines, energy, timeSeconds, frameIndex, totalFrames);
+        cv::Mat frame = composeFrame(previewConfig, base, circleCover, lyricLines, energy, timeSeconds, frameIndex, totalFrames, previewConfig.enableFastPreview);
         cv::Mat rgb;
         cv::cvtColor(frame, rgb, cv::COLOR_BGR2RGB);
         QImage image(rgb.data, rgb.cols, rgb.rows, static_cast<int>(rgb.step), QImage::Format_RGB888);

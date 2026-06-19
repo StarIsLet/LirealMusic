@@ -56,6 +56,12 @@ struct RenderConfig {
     bool enableMangaFilter = true;
     bool enableImpactFlash = true;
     bool enableParticles = true;
+
+    // 预览专用：极速预览会自动降采样、降帧率并跳过昂贵光效；导出仍使用完整质量。
+    bool enableFastPreview = true;
+    int previewMaxWidth = 960;
+    int previewMaxHeight = 540;
+    int previewFps = 30;
 };
 
 } // namespace lireal::render
