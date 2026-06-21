@@ -227,7 +227,7 @@ void DashboardWindow::buildUi() {
         edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     }
     backgroundEdit_->setPlaceholderText(QStringLiteral("请选择或拖入背景图片路径"));
-    musicEdit_->setPlaceholderText(QStringLiteral("请选择或拖入音乐文件路径"));
+    musicEdit_->setPlaceholderText(QStringLiteral("请选择或拖入音频/视频音乐来源路径"));
     lyricsEdit_->setPlaceholderText(QStringLiteral("请选择或拖入 LRC 歌词路径"));
     outputEdit_->setPlaceholderText(QStringLiteral("请选择输出 MP4 路径"));
     songTitleEdit_->setPlaceholderText(QStringLiteral("例如：出山DJ"));
@@ -244,7 +244,7 @@ void DashboardWindow::buildUi() {
     };
 
     auto* backgroundButton = makeBrowseButton(QStringLiteral("选择背景"));
-    auto* musicButton = makeBrowseButton(QStringLiteral("选择音乐"));
+    auto* musicButton = makeBrowseButton(QStringLiteral("选择音频/视频"));
     auto* lyricsButton = makeBrowseButton(QStringLiteral("选择歌词"));
     auto* outputButton = makeBrowseButton(QStringLiteral("保存位置"));
 
@@ -1100,14 +1100,16 @@ bool DashboardWindow::validateConfig(lireal::render::RenderConfig& config) {
     const QString lyricPath = QString::fromStdString(config.lyricPath.string()).trimmed();
     QString outputPath = QString::fromStdString(config.outputVideoPath.string()).trimmed();
 
-    if (backgroundPath.isEmpty() || musicPath.isEmpty() || lyricPath.isEmpty() || outputPath.isEmpty()) {
-        QMessageBox::warning(this, QStringLiteral("素材不完整"), QStringLiteral("请先选择背景、音频/视频音乐来源、歌词和输出路径。"));
+    if (musicPath.isEmpty() || outputPath.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("素材不完整"), QStringLiteral("请先选择音频/视频音乐来源和输出路径。"));
         return false;
     }
 
     const QStringList imageSuffixes = {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("webp"), QStringLiteral("bmp")};
     const QStringList audioSuffixes = audioSourceSuffixes();
+    const QStringList videoSuffixes = videoSourceSuffixes();
     const QStringList lyricSuffixes = {QStringLiteral("lrc"), QStringLiteral("txt")};
+    const bool videoAudioOnlyMode = hasAllowedSuffix(musicPath, videoSuffixes);
 
     auto requireReadableFile = [&](const QString& path, const QString& name, const QStringList& suffixes) -> bool {
         const QFileInfo info(path);
@@ -1130,28 +1132,36 @@ bool DashboardWindow::validateConfig(lireal::render::RenderConfig& config) {
         return true;
     };
 
-    if (!requireReadableFile(backgroundPath, QStringLiteral("背景图片"), imageSuffixes)) {
-        return false;
-    }
     if (!requireReadableFile(musicPath, QStringLiteral("音乐来源（音频/视频）"), audioSuffixes)) {
         return false;
     }
-    if (!requireReadableFile(lyricPath, QStringLiteral("歌词文件"), lyricSuffixes)) {
-        return false;
+    if (!videoAudioOnlyMode) {
+        if (backgroundPath.isEmpty() || lyricPath.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("素材不完整"), QStringLiteral("生成 MV 需要选择背景和歌词；如果选择视频文件作为音乐来源，则会自动保留原视频画面并只处理音频。"));
+            return false;
+        }
+        if (!requireReadableFile(backgroundPath, QStringLiteral("背景图片"), imageSuffixes)) {
+            return false;
+        }
+        if (!requireReadableFile(lyricPath, QStringLiteral("歌词文件"), lyricSuffixes)) {
+            return false;
+        }
     }
 
-    QFile lyricFile(lyricPath);
-    if (lyricFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        const QByteArray sample = lyricFile.read(4096);
-        if (!sample.contains('[') || !sample.contains(']')) {
-            const auto result = QMessageBox::question(
-                this,
-                QStringLiteral("歌词可能不是 LRC"),
-                QStringLiteral("歌词文件看起来没有时间轴标签，例如 [00:12.34]。\n仍然继续渲染吗？"),
-                QMessageBox::Yes | QMessageBox::No,
-                QMessageBox::No);
-            if (result != QMessageBox::Yes) {
-                return false;
+    if (!videoAudioOnlyMode) {
+        QFile lyricFile(lyricPath);
+        if (lyricFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            const QByteArray sample = lyricFile.read(4096);
+            if (!sample.contains('[') || !sample.contains(']')) {
+                const auto result = QMessageBox::question(
+                    this,
+                    QStringLiteral("歌词可能不是 LRC"),
+                    QStringLiteral("歌词文件看起来没有时间轴标签，例如 [00:12.34]。\n仍然继续渲染吗？"),
+                    QMessageBox::Yes | QMessageBox::No,
+                    QMessageBox::No);
+                if (result != QMessageBox::Yes) {
+                    return false;
+                }
             }
         }
     }
@@ -1189,10 +1199,18 @@ bool DashboardWindow::validateConfig(lireal::render::RenderConfig& config) {
         }
     }
 
+    if (QFileInfo(musicPath).absoluteFilePath() == QFileInfo(outputPath).absoluteFilePath()) {
+        QMessageBox::warning(this, QStringLiteral("输出路径冲突"), QStringLiteral("输出 MP4 不能覆盖原始音乐/视频来源，请选择新的输出文件。"));
+        return false;
+    }
+
     config.backgroundImagePath = backgroundPath.toStdString();
     config.musicPath = musicPath.toStdString();
     config.lyricPath = lyricPath.toStdString();
     config.outputVideoPath = outputPath.toStdString();
+    if (videoAudioOnlyMode) {
+        appendLog(QStringLiteral("检测到视频音乐来源：保留原视频画面，只处理并替换增强音轨。"));
+    }
     appendLog(QStringLiteral("素材检查通过，准备开始渲染。"));
     return true;
 }

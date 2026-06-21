@@ -1171,6 +1171,22 @@ bool startsWith(const std::string& text, const std::string& prefix) {
     return text.rfind(prefix, 0) == 0;
 }
 
+std::string lowerExtension(const std::filesystem::path& path) {
+    std::string extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return extension;
+}
+
+bool isVideoMusicSource(const std::filesystem::path& path) {
+    const std::string extension = lowerExtension(path);
+    static const std::array<std::string, 7> videoExtensions = {
+        ".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".wmv"
+    };
+    return std::find(videoExtensions.begin(), videoExtensions.end(), extension) != videoExtensions.end();
+}
+
 int effectiveRenderThreads(const RenderConfig& config) {
     const int hardwareThreads = static_cast<int>(std::max(1U, std::thread::hardware_concurrency()));
     if (config.renderThreads <= 0) {
@@ -1266,12 +1282,11 @@ std::string resolveEncoderBackend(const RenderConfig& config) {
     return "libx264";
 }
 
-void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
+std::string makeHifiSurroundFilter(const std::string& inputPad) {
     const std::string hifiPreEq = ffmpegHasFilter("firequalizer")
         ? "firequalizer=gain_entry='entry(28,-3.2);entry(42,-1.2);entry(64,1.8);entry(110,1.0);entry(240,-1.4);entry(520,-0.6);entry(1200,0.45);entry(3200,1.15);entry(7200,0.9);entry(11200,1.5);entry(16000,0.8)':zero_phase=on:delay=0.018,"
         : "equalizer=f=64:t=q:w=1.05:g=1.6,equalizer=f=240:t=q:w=1.20:g=-1.1,equalizer=f=3200:t=q:w=1.05:g=1.0,equalizer=f=11200:t=q:w=0.85:g=1.3,";
-    const std::string surroundFilter =
-        "[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+    return inputPad + "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
         "highpass=f=22,lowpass=f=20700," + hifiPreEq +
         "dynaudnorm=f=180:g=10:p=0.56:m=14:s=20,"
         "asplit=7[dry][wide][air][bass][glue][depth][spark];"
@@ -1300,6 +1315,10 @@ void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::f
         "acompressor=threshold=0.70:ratio=1.28:attack=7:release=118:makeup=1.02,"
         "alimiter=limit=0.955:level=disabled,"
         "aresample=48000:resampler=soxr:precision=30[aout]";
+}
+
+void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
+    const std::string surroundFilter = makeHifiSurroundFilter("[1:a]");
 
     std::ostringstream command;
     command << "ffmpeg -y -hide_banner -loglevel error "
@@ -1325,6 +1344,34 @@ void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::f
 
     if (std::system(fallbackCommand.str().c_str()) != 0) {
         throw std::runtime_error("FFmpeg 音轨合并失败，请确认已安装 ffmpeg 命令行工具");
+    }
+}
+
+void enhanceSourceVideoAudioOnlyWithFfmpeg(const std::filesystem::path& sourceVideoPath, const std::filesystem::path& outputPath) {
+    const std::string surroundFilter = makeHifiSurroundFilter("[0:a]");
+
+    std::ostringstream command;
+    command << "ffmpeg -y -hide_banner -loglevel error "
+            << "-i " << shellQuote(sourceVideoPath) << ' '
+            << "-filter_complex " << shellQuoteText(surroundFilter) << ' '
+            << "-map 0:v:0 -map [aout] "
+            << "-c:v copy -c:a aac -b:a 512k -ar 48000 -shortest -movflags +faststart "
+            << shellQuote(outputPath);
+
+    const int exitCode = std::system(command.str().c_str());
+    if (exitCode == 0) {
+        return;
+    }
+
+    std::ostringstream fallbackCommand;
+    fallbackCommand << "ffmpeg -y -hide_banner -loglevel error "
+                    << "-i " << shellQuote(sourceVideoPath) << ' '
+                    << "-map 0:v:0 -map 0:a:0 "
+                    << "-c:v copy -c:a aac -b:a 512k -ar 48000 -shortest -movflags +faststart "
+                    << shellQuote(outputPath);
+
+    if (std::system(fallbackCommand.str().c_str()) != 0) {
+        throw std::runtime_error("FFmpeg 原视频音轨处理失败，请确认视频包含音轨且已安装 ffmpeg 命令行工具");
     }
 }
 
@@ -1431,11 +1478,42 @@ VideoRenderer::VideoRenderer() = default;
 VideoRenderer::~VideoRenderer() = default;
 
 void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& onProgress, const CancelCallback& shouldCancel, const PreviewFrameCallback& onPreviewFrame) const {
-    if (config.backgroundImagePath.empty() || config.musicPath.empty() || config.lyricPath.empty() || config.outputVideoPath.empty()) {
-        throw std::runtime_error("背景、音乐、歌词、输出路径都必须选择");
+    if (config.musicPath.empty() || config.outputVideoPath.empty()) {
+        throw std::runtime_error("音乐来源和输出路径都必须选择");
+    }
+    if (!isVideoMusicSource(config.musicPath) && (config.backgroundImagePath.empty() || config.lyricPath.empty())) {
+        throw std::runtime_error("生成 MV 时背景、音乐、歌词、输出路径都必须选择");
+    }
+    const std::filesystem::path absoluteMusicPath = std::filesystem::absolute(config.musicPath);
+    const std::filesystem::path absoluteOutputPath = std::filesystem::absolute(config.outputVideoPath);
+    if (absoluteMusicPath == absoluteOutputPath) {
+        throw std::runtime_error("输出路径不能覆盖原视频/音乐来源，请选择新的 MP4 文件");
     }
 
     std::signal(SIGPIPE, SIG_IGN);
+
+    if (isVideoMusicSource(config.musicPath)) {
+        if (onProgress) {
+            onProgress({0, 1, 0.02, "视频音频增强模式：保留原视频画面，只处理音轨"});
+        }
+        if (shouldCancel && shouldCancel()) {
+            throw std::runtime_error("渲染已由用户取消");
+        }
+        audio::AudioAnalyzer analyzer;
+        (void)analyzer.analyze(config.musicPath, config.fps);
+        if (onProgress) {
+            onProgress({0, 1, 0.55, "音频预处理完成，正在复制原视频画面并写入增强音轨"});
+        }
+        if (shouldCancel && shouldCancel()) {
+            throw std::runtime_error("渲染已由用户取消");
+        }
+        enhanceSourceVideoAudioOnlyWithFfmpeg(config.musicPath, config.outputVideoPath);
+        if (onProgress) {
+            onProgress({1, 1, 1.0, "原视频画面已保留，HiFi 双声道 3D 音轨处理完成"});
+        }
+        (void)onPreviewFrame;
+        return;
+    }
 
     cv::Mat background = cv::imread(config.backgroundImagePath.string(), cv::IMREAD_COLOR);
     if (background.empty()) {
