@@ -1284,34 +1284,40 @@ std::string resolveEncoderBackend(const RenderConfig& config) {
 
 std::string makeHifiSurroundFilter(const std::string& inputPad) {
     const std::string hifiPreEq = ffmpegHasFilter("firequalizer")
-        ? "firequalizer=gain_entry='entry(26,-1.8);entry(45,-0.8);entry(72,0.9);entry(120,0.45);entry(250,-0.55);entry(520,-0.35);entry(1500,0.25);entry(3200,0.75);entry(6800,0.55);entry(10500,0.95);entry(15500,0.45)':zero_phase=on:delay=0.012,"
-        : "equalizer=f=72:t=q:w=1.00:g=0.8,equalizer=f=250:t=q:w=1.15:g=-0.5,equalizer=f=3200:t=q:w=1.00:g=0.7,equalizer=f=10500:t=q:w=0.90:g=0.9,";
+        ? "firequalizer=gain_entry='entry(24,-2.0);entry(38,-0.9);entry(64,0.9);entry(95,0.55);entry(180,-0.25);entry(300,-0.65);entry(620,-0.35);entry(1250,0.20);entry(2600,0.58);entry(4200,0.75);entry(7600,0.55);entry(10800,0.85);entry(15500,0.38)':zero_phase=on:delay=0.012,"
+        : "equalizer=f=64:t=q:w=1.00:g=0.8,equalizer=f=300:t=q:w=1.15:g=-0.6,equalizer=f=2600:t=q:w=1.00:g=0.55,equalizer=f=10800:t=q:w=0.90:g=0.8,";
     const std::string denoise = ffmpegHasFilter("afftdn") ? "afftdn=nr=5:nf=-72," : "";
-    const std::string crystal = ffmpegHasFilter("crystalizer") ? "crystalizer=i=0.45:c=0," : "";
-    const std::string stereoWidth = ffmpegHasFilter("stereotools")
-        ? "stereotools=mlev=0.98:slev=1.32:base=0.18:delay=5.5:phase=6:softclip=1,"
-        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=1.55:c=0," : "");
+    const std::string crystal = ffmpegHasFilter("crystalizer") ? "crystalizer=i=0.38:c=0," : "";
+    const std::string headphoneGlue = ffmpegHasFilter("crossfeed") ? "crossfeed=strength=0.18:range=0.72:slope=0.42:level_in=0.96:level_out=1.0," : "";
+    const std::string nearWidth = ffmpegHasFilter("stereotools")
+        ? "stereotools=mlev=0.99:slev=1.22:base=0.13:delay=3.6:phase=3.5:softclip=1,"
+        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=1.32:c=0," : "");
+    const std::string farWidth = ffmpegHasFilter("stereotools")
+        ? "stereotools=mlev=0.96:slev=1.45:base=0.24:delay=7.8:phase=8.0:softclip=1,"
+        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=1.72:c=0," : "");
     return inputPad + "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-        "highpass=f=24,lowpass=f=20500," + denoise + hifiPreEq +
-        "asplit=5[clean][wide][air][bass][body];"
-        "[clean]volume=0.92[dry];"
-        "[wide]highpass=f=180,lowpass=f=13500,"
-        "pan=stereo|c0=0.90*c0-0.16*c1|c1=-0.16*c0+0.90*c1,"
-        + stereoWidth +
-        "volume=0.34[wide3d];"
-        "[air]highpass=f=4200,"
-        "adelay=9|0,"
-        "aecho=0.12:0.18:28|58:0.045|0.026,"
-        "volume=0.13[air3d];"
-        "[bass]lowpass=f=145,"
-        "pan=stereo|c0=0.50*c0+0.50*c1|c1=0.50*c0+0.50*c1,"
-        "volume=0.38[bassmono];"
-        "[body]bandpass=f=950:w=3200,acompressor=threshold=0.24:ratio=1.22:attack=18:release=160:makeup=1.10,"
-        "volume=0.16[bodyglue];"
-        "[dry][wide3d][air3d][bassmono][bodyglue]amix=inputs=5:weights=0.92 0.30 0.10 0.24 0.12:normalize=0,"
-        "acompressor=threshold=0.82:ratio=1.16:attack=12:release=180:makeup=1.00,"
-        + crystal +
-        "alimiter=limit=0.965:level=disabled,"
+        "highpass=f=23,lowpass=f=20500," + denoise + hifiPreEq +
+        "asplit=15[main][center][sub][punch][warm][presence][sparkle][air][leftnear][rightnear][leftfar][rightfar][front][rear][ceiling];"
+        "[main]volume=0.74[mainout];"
+        "[center]highpass=f=120,lowpass=f=4200,pan=stereo|c0=0.54*c0+0.46*c1|c1=0.46*c0+0.54*c1,volume=0.30[centerout];"
+        "[sub]lowpass=f=105,pan=stereo|c0=0.50*c0+0.50*c1|c1=0.50*c0+0.50*c1,volume=0.22[subout];"
+        "[punch]highpass=f=70,lowpass=f=185,acompressor=threshold=0.30:ratio=1.28:attack=12:release=140:makeup=1.05,volume=0.14[punchout];"
+        "[warm]bandpass=f=420:w=520,volume=0.12[warmout];"
+        "[presence]bandpass=f=2350:w=2800,acompressor=threshold=0.22:ratio=1.18:attack=10:release=120:makeup=1.06,volume=0.11[presenceout];"
+        "[sparkle]highpass=f=7800," + crystal + "volume=0.075[sparkleout];"
+        "[air]highpass=f=5200,adelay=11|0,aecho=0.08:0.13:34|67:0.030|0.018,volume=0.070[airout];"
+        "[leftnear]highpass=f=170,lowpass=f=12000,adelay=0|5,pan=stereo|c0=1.00*c0+0.06*c1|c1=0.18*c0+0.54*c1," + nearWidth + "volume=0.16[leftnearout];"
+        "[rightnear]highpass=f=170,lowpass=f=12000,adelay=5|0,pan=stereo|c0=0.54*c0+0.18*c1|c1=0.06*c0+1.00*c1," + nearWidth + "volume=0.16[rightnearout];"
+        "[leftfar]highpass=f=260,lowpass=f=9800,adelay=0|15,pan=stereo|c0=0.92*c0-0.18*c1|c1=0.15*c0+0.48*c1," + farWidth + "volume=0.12[leftfarout];"
+        "[rightfar]highpass=f=260,lowpass=f=9800,adelay=15|0,pan=stereo|c0=0.48*c0+0.15*c1|c1=-0.18*c0+0.92*c1," + farWidth + "volume=0.12[rightfarout];"
+        "[front]highpass=f=220,lowpass=f=7000,pan=stereo|c0=0.60*c0+0.40*c1|c1=0.40*c0+0.60*c1,adelay=3|3,volume=0.105[frontout];"
+        "[rear]highpass=f=320,lowpass=f=6200,adelay=24|31,aecho=0.10:0.16:82|137:0.032|0.018,pan=stereo|c0=0.78*c1|c1=0.78*c0,volume=0.090[rearout];"
+        "[ceiling]highpass=f=6200,adelay=7|13,aecho=0.07:0.11:43|91:0.024|0.014,volume=0.055[ceilingout];"
+        "[mainout][centerout][subout][punchout][warmout][presenceout][sparkleout][airout][leftnearout][rightnearout][leftfarout][rightfarout][frontout][rearout][ceilingout]"
+        "amix=inputs=15:weights=0.78 0.24 0.18 0.12 0.09 0.09 0.055 0.052 0.12 0.12 0.090 0.090 0.075 0.060 0.040:normalize=0,"
+        + headphoneGlue +
+        "acompressor=threshold=0.84:ratio=1.13:attack=16:release=210:makeup=1.00,"
+        "alimiter=limit=0.962:attack=3:release=95:level=disabled,"
         "aresample=48000:resampler=soxr:precision=33[aout]";
 }
 
