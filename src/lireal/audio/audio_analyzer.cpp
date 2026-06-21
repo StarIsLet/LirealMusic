@@ -143,17 +143,17 @@ AudioAnalyzer::~AudioAnalyzer() = default;
 AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPath, int targetFps) const {
     AVFormatContext* rawFormat = nullptr;
     if (avformat_open_input(&rawFormat, audioPath.c_str(), nullptr, nullptr) < 0) {
-        throw std::runtime_error("无法打开音乐文件: " + audioPath.string());
+        throw std::runtime_error("无法打开音频/视频音乐来源: " + audioPath.string());
     }
     std::unique_ptr<AVFormatContext, FormatContextDeleter> format(rawFormat);
 
     if (avformat_find_stream_info(format.get(), nullptr) < 0) {
-        throw std::runtime_error("无法读取音乐流信息: " + audioPath.string());
+        throw std::runtime_error("无法读取音频/视频流信息: " + audioPath.string());
     }
 
     const int streamIndex = av_find_best_stream(format.get(), AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (streamIndex < 0) {
-        throw std::runtime_error("音乐文件中没有可用音频流: " + audioPath.string());
+        throw std::runtime_error("文件中没有可用音频流，请选择带声音的视频或音乐文件: " + audioPath.string());
     }
 
     AVStream* stream = format->streams[streamIndex];

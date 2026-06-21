@@ -78,6 +78,37 @@ bool hasAllowedSuffix(const QString& path, const QStringList& suffixes) {
     return suffixes.contains(suffix);
 }
 
+QStringList audioSourceSuffixes() {
+    return {
+        QStringLiteral("mp3"),
+        QStringLiteral("wav"),
+        QStringLiteral("flac"),
+        QStringLiteral("aac"),
+        QStringLiteral("ogg"),
+        QStringLiteral("m4a"),
+        QStringLiteral("opus"),
+        QStringLiteral("mp4"),
+        QStringLiteral("mkv"),
+        QStringLiteral("webm"),
+        QStringLiteral("mov"),
+        QStringLiteral("avi"),
+        QStringLiteral("flv"),
+        QStringLiteral("wmv")
+    };
+}
+
+QStringList videoSourceSuffixes() {
+    return {
+        QStringLiteral("mp4"),
+        QStringLiteral("mkv"),
+        QStringLiteral("webm"),
+        QStringLiteral("mov"),
+        QStringLiteral("avi"),
+        QStringLiteral("flv"),
+        QStringLiteral("wmv")
+    };
+}
+
 QString describeSuffixes(const QStringList& suffixes) {
     QStringList display;
     for (const QString& suffix : suffixes) {
@@ -218,7 +249,7 @@ void DashboardWindow::buildUi() {
     auto* outputButton = makeBrowseButton(QStringLiteral("保存位置"));
 
     addPicker(QStringLiteral("背景图片"), backgroundEdit_, backgroundButton);
-    addPicker(QStringLiteral("音乐文件"), musicEdit_, musicButton);
+    addPicker(QStringLiteral("音乐来源（音频/视频）"), musicEdit_, musicButton);
     addPicker(QStringLiteral("LRC 歌词"), lyricsEdit_, lyricsButton);
     addPicker(QStringLiteral("输出 MP4"), outputEdit_, outputButton);
     form->addRow(QStringLiteral("歌曲名"), songTitleEdit_);
@@ -422,7 +453,7 @@ void DashboardWindow::buildUi() {
     rootLayout->addWidget(scrollArea, 1);
 
     setCentralWidget(central);
-    appendLog(QStringLiteral("欢迎使用 Lireal Dashboard，请先选择背景、音乐和歌词。"));
+    appendLog(QStringLiteral("欢迎使用 Lireal Dashboard，请先选择背景、音频/视频音乐来源和歌词。"));
     appendLog(QStringLiteral("模板：左侧歌名/作者/圆盘频谱，右侧滚动歌词，配色自动跟随背景浅色化。"));
 }
 
@@ -434,7 +465,7 @@ void DashboardWindow::chooseBackground() {
 }
 
 void DashboardWindow::chooseMusic() {
-    const QString path = openFileDialog(this, QStringLiteral("选择音乐文件"), QStringLiteral("Audio (*.mp3 *.wav *.flac *.aac *.ogg *.m4a)"));
+    const QString path = openFileDialog(this, QStringLiteral("选择音频或视频音乐来源"), QStringLiteral("Audio/Video (*.mp3 *.wav *.flac *.aac *.ogg *.m4a *.opus *.mp4 *.mkv *.webm *.mov *.avi *.flv *.wmv);;Audio (*.mp3 *.wav *.flac *.aac *.ogg *.m4a *.opus);;Video (*.mp4 *.mkv *.webm *.mov *.avi *.flv *.wmv)"));
     if (!path.isEmpty()) {
         musicEdit_->setText(path);
     }
@@ -571,7 +602,9 @@ void DashboardWindow::dragEnterEvent(QDragEnterEvent* event) {
     }
     for (const QUrl& url : event->mimeData()->urls()) {
         const QString path = url.toLocalFile();
-        if (hasAllowedSuffix(path, {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("webp"), QStringLiteral("bmp"), QStringLiteral("mp3"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("aac"), QStringLiteral("ogg"), QStringLiteral("m4a"), QStringLiteral("lrc"), QStringLiteral("txt"), QStringLiteral("mp4")})) {
+        QStringList acceptedSuffixes = {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("webp"), QStringLiteral("bmp"), QStringLiteral("lrc"), QStringLiteral("txt"), QStringLiteral("mp4")};
+        acceptedSuffixes.append(audioSourceSuffixes());
+        if (hasAllowedSuffix(path, acceptedSuffixes)) {
             event->acceptProposedAction();
             return;
         }
@@ -580,7 +613,8 @@ void DashboardWindow::dragEnterEvent(QDragEnterEvent* event) {
 
 void DashboardWindow::dropEvent(QDropEvent* event) {
     const QStringList imageSuffixes = {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("webp"), QStringLiteral("bmp")};
-    const QStringList audioSuffixes = {QStringLiteral("mp3"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("aac"), QStringLiteral("ogg"), QStringLiteral("m4a")};
+    const QStringList audioSuffixes = audioSourceSuffixes();
+    const QStringList videoSuffixes = videoSourceSuffixes();
     const QStringList lyricSuffixes = {QStringLiteral("lrc"), QStringLiteral("txt")};
 
     bool assigned = false;
@@ -595,15 +629,15 @@ void DashboardWindow::dropEvent(QDropEvent* event) {
             assigned = true;
         } else if (hasAllowedSuffix(path, audioSuffixes)) {
             musicEdit_->setText(path);
-            appendLog(QStringLiteral("已拖拽导入音乐：") + path);
+            if (hasAllowedSuffix(path, videoSuffixes)) {
+                appendLog(QStringLiteral("已拖拽导入视频音轨作为音乐来源：") + path);
+            } else {
+                appendLog(QStringLiteral("已拖拽导入音乐：") + path);
+            }
             assigned = true;
         } else if (hasAllowedSuffix(path, lyricSuffixes)) {
             lyricsEdit_->setText(path);
             appendLog(QStringLiteral("已拖拽导入歌词：") + path);
-            assigned = true;
-        } else if (hasAllowedSuffix(path, {QStringLiteral("mp4")})) {
-            outputEdit_->setText(path);
-            appendLog(QStringLiteral("已拖拽设置输出：") + path);
             assigned = true;
         }
     }
@@ -1067,12 +1101,12 @@ bool DashboardWindow::validateConfig(lireal::render::RenderConfig& config) {
     QString outputPath = QString::fromStdString(config.outputVideoPath.string()).trimmed();
 
     if (backgroundPath.isEmpty() || musicPath.isEmpty() || lyricPath.isEmpty() || outputPath.isEmpty()) {
-        QMessageBox::warning(this, QStringLiteral("素材不完整"), QStringLiteral("请先选择背景、音乐、歌词和输出路径。"));
+        QMessageBox::warning(this, QStringLiteral("素材不完整"), QStringLiteral("请先选择背景、音频/视频音乐来源、歌词和输出路径。"));
         return false;
     }
 
     const QStringList imageSuffixes = {QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"), QStringLiteral("webp"), QStringLiteral("bmp")};
-    const QStringList audioSuffixes = {QStringLiteral("mp3"), QStringLiteral("wav"), QStringLiteral("flac"), QStringLiteral("aac"), QStringLiteral("ogg"), QStringLiteral("m4a")};
+    const QStringList audioSuffixes = audioSourceSuffixes();
     const QStringList lyricSuffixes = {QStringLiteral("lrc"), QStringLiteral("txt")};
 
     auto requireReadableFile = [&](const QString& path, const QString& name, const QStringList& suffixes) -> bool {
@@ -1099,7 +1133,7 @@ bool DashboardWindow::validateConfig(lireal::render::RenderConfig& config) {
     if (!requireReadableFile(backgroundPath, QStringLiteral("背景图片"), imageSuffixes)) {
         return false;
     }
-    if (!requireReadableFile(musicPath, QStringLiteral("音乐文件"), audioSuffixes)) {
+    if (!requireReadableFile(musicPath, QStringLiteral("音乐来源（音频/视频）"), audioSuffixes)) {
         return false;
     }
     if (!requireReadableFile(lyricPath, QStringLiteral("歌词文件"), lyricSuffixes)) {
