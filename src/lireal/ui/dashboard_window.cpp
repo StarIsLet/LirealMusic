@@ -904,14 +904,19 @@ void DashboardWindow::generatePreview() {
     const double selectedPreviewTime = previewTimeCombo_->currentData().toDouble();
     const double previewTimeSeconds = selectedPreviewTime < 0.0 ? previewTimeSpin_->value() : selectedPreviewTime;
     constexpr double previewDurationSeconds = 0.0;
+    const bool videoAudioOnlyMode = hasAllowedSuffix(QString::fromStdString(config.musicPath.string()), videoSourceSuffixes());
 
     auto* previewDialog = new QDialog(this);
     previewDialog->setAttribute(Qt::WA_DeleteOnClose, true);
-    previewDialog->setWindowTitle(QStringLiteral("Lireal 播放器预览 · 先音频后画面 / 连续播放"));
+    previewDialog->setWindowTitle(videoAudioOnlyMode
+        ? QStringLiteral("Lireal 视频音频预览 · 原画面保持不变")
+        : QStringLiteral("Lireal 播放器预览 · 先音频后画面 / 连续播放"));
     previewDialog->resize(std::min(config.width + 360, 1760), std::min(config.height + 70, 940));
     auto* previewLayout = new QVBoxLayout(previewDialog);
     auto* previewBodyLayout = new QHBoxLayout;
-    auto* previewLabel = new QLabel(QStringLiteral("正在分析音乐并准备实时预览…"));
+    auto* previewLabel = new QLabel(videoAudioOnlyMode
+        ? QStringLiteral("视频来源模式：原视频画面保持不变，只预处理和增强声音…")
+        : QStringLiteral("正在分析音乐并准备实时预览…"));
     previewLabel->setAlignment(Qt::AlignCenter);
     previewLabel->setMinimumSize(640, 360);
     previewLabel->setStyleSheet(QStringLiteral("background:#140f1f;color:#fff0fb;border-radius:18px;"));
@@ -919,8 +924,12 @@ void DashboardWindow::generatePreview() {
     audioPanel->setReadOnly(true);
     audioPanel->setMinimumWidth(320);
     audioPanel->setStyleSheet(QStringLiteral("background:#fff7fc;color:#5d4260;border:1px solid #ffd5ec;border-radius:16px;padding:12px;font-family:'Noto Sans Mono CJK SC','monospace';"));
-    audioPanel->setText(QStringLiteral("🎧 音频处理状态\n\n正在解码、分轨和计算频谱喵…"));
-    auto* hintLabel = new QLabel(QStringLiteral("播放器模式：先完成音频解码/分轨/频谱预处理，再按预览 FPS 连续生成画面；关闭窗口即可停止。"));
+    audioPanel->setText(videoAudioOnlyMode
+        ? QStringLiteral("🎧 视频音频处理状态\n\n视频画面会保持原样喵。\n这里只分析音轨、频谱和声场，导出时只替换增强后的声音。")
+        : QStringLiteral("🎧 音频处理状态\n\n正在解码、分轨和计算频谱喵…"));
+    auto* hintLabel = new QLabel(videoAudioOnlyMode
+        ? QStringLiteral("视频来源模式：不需要背景图和歌词；原视频画面不会重绘，只处理并替换音轨。")
+        : QStringLiteral("播放器模式：先完成音频解码/分轨/频谱预处理，再按预览 FPS 连续生成画面；关闭窗口即可停止。"));
     hintLabel->setAlignment(Qt::AlignCenter);
     previewBodyLayout->addWidget(previewLabel, 1);
     previewBodyLayout->addWidget(audioPanel);
@@ -941,30 +950,40 @@ void DashboardWindow::generatePreview() {
     cancelButton_->setEnabled(false);
     progressBar_->setValue(0);
     renderTimer_.restart();
-    appendLog(QStringLiteral("打开播放器式实时预览：从 %1 秒开始连续播放到歌曲结束；导出源为 %2×%3，预览自动降采样到最多 1280×720 / 独立 30FPS。")
-        .arg(previewTimeSeconds, 0, 'f', 1)
-        .arg(config.width)
-        .arg(config.height));
+    appendLog(videoAudioOnlyMode
+        ? QStringLiteral("打开视频音频预览：原视频画面保持不变，只预处理和增强声音。")
+        : QStringLiteral("打开播放器式实时预览：从 %1 秒开始连续播放到歌曲结束；导出源为 %2×%3，预览自动降采样到最多 1280×720 / 独立 30FPS。")
+            .arg(previewTimeSeconds, 0, 'f', 1)
+            .arg(config.width)
+            .arg(config.height));
 
-    auto future = QtConcurrent::run([this, config, previewTimeSeconds, previewDurationSeconds, dialogGuard, labelGuard, audioPanelGuard, cancelPreview]() {
+    auto future = QtConcurrent::run([this, config, previewTimeSeconds, previewDurationSeconds, videoAudioOnlyMode, dialogGuard, labelGuard, audioPanelGuard, cancelPreview]() {
         try {
-            QMetaObject::invokeMethod(this, [dialogGuard, labelGuard, audioPanelGuard]() {
+            QMetaObject::invokeMethod(this, [dialogGuard, labelGuard, audioPanelGuard, videoAudioOnlyMode]() {
                 if (!dialogGuard.isNull() && !labelGuard.isNull()) {
-                    labelGuard->setText(QStringLiteral("阶段 1/2：正在预处理音频…"));
+                    labelGuard->setText(videoAudioOnlyMode
+                        ? QStringLiteral("视频来源：画面不重绘，正在预处理音频…")
+                        : QStringLiteral("阶段 1/2：正在预处理音频…"));
                 }
                 if (!audioPanelGuard.isNull()) {
-                    audioPanelGuard->setText(QStringLiteral("🎧 音频处理状态\n\n阶段 1/2：正在解码、分轨、重采样和计算频谱喵…"));
+                    audioPanelGuard->setText(videoAudioOnlyMode
+                        ? QStringLiteral("🎧 视频音频处理状态\n\n正在解码原视频音轨、重采样、分轨和计算频谱喵…")
+                        : QStringLiteral("🎧 音频处理状态\n\n阶段 1/2：正在解码、分轨、重采样和计算频谱喵…"));
                 }
             }, Qt::QueuedConnection);
 
             lireal::render::VideoRenderer renderer;
             const auto analysis = renderer.analyzePreviewAudio(config);
-            QMetaObject::invokeMethod(this, [dialogGuard, labelGuard, audioPanelGuard, duration = analysis.durationSeconds]() {
+            QMetaObject::invokeMethod(this, [dialogGuard, labelGuard, audioPanelGuard, duration = analysis.durationSeconds, videoAudioOnlyMode]() {
                 if (!dialogGuard.isNull() && !labelGuard.isNull()) {
-                    labelGuard->setText(QStringLiteral("阶段 2/2：音频已就绪，正在启动播放器画面循环…"));
+                    labelGuard->setText(videoAudioOnlyMode
+                        ? QStringLiteral("音频已就绪：原视频画面保持不变，导出时只替换增强音轨")
+                        : QStringLiteral("阶段 2/2：音频已就绪，正在启动播放器画面循环…"));
                 }
                 if (!audioPanelGuard.isNull()) {
-                    audioPanelGuard->setText(QStringLiteral("🎧 音频处理状态\n\n音频预处理完成：%1 秒\n正在启动画面播放器循环喵…").arg(duration, 0, 'f', 1));
+                    audioPanelGuard->setText(videoAudioOnlyMode
+                        ? QStringLiteral("🎧 视频音频处理状态\n\n音频预处理完成：%1 秒\n视频画面不会重新生成，导出时只处理声音喵…").arg(duration, 0, 'f', 1)
+                        : QStringLiteral("🎧 音频处理状态\n\n音频预处理完成：%1 秒\n正在启动画面播放器循环喵…").arg(duration, 0, 'f', 1));
                 }
             }, Qt::QueuedConnection);
             renderer.renderPreviewStreamFromAnalysis(config, analysis, previewTimeSeconds, previewDurationSeconds, [this, dialogGuard, labelGuard, audioPanelGuard, cancelPreview, previewFps = std::clamp(config.previewFps, 12, 60)](const QImage& image, int current, int total, const lireal::audio::AudioFrameEnergy& energy) {

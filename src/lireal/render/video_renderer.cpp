@@ -1656,8 +1656,14 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
 
 void VideoRenderer::renderPreviewImage(const RenderConfig& config, const std::filesystem::path& previewPath, double preferredTimeSeconds) const {
     const RenderConfig previewConfig = makeFastPreviewConfig(config);
-    if (previewConfig.backgroundImagePath.empty() || previewConfig.musicPath.empty() || previewConfig.lyricPath.empty()) {
-        throw std::runtime_error("背景、音乐、歌词都必须选择后才能生成预览图");
+    if (previewConfig.musicPath.empty()) {
+        throw std::runtime_error("必须选择音乐来源后才能生成预览");
+    }
+    if (isVideoMusicSource(previewConfig.musicPath)) {
+        throw std::runtime_error("视频来源会保留原视频画面，只处理声音，不需要生成 MV 预览图");
+    }
+    if (previewConfig.backgroundImagePath.empty() || previewConfig.lyricPath.empty()) {
+        throw std::runtime_error("普通音频生成 MV 时，背景和歌词都必须选择后才能生成预览图");
     }
 
     cv::Mat background = cv::imread(previewConfig.backgroundImagePath.string(), cv::IMREAD_COLOR);
@@ -1709,11 +1715,31 @@ audio::AudioAnalysisResult VideoRenderer::analyzePreviewAudio(const RenderConfig
 
 void VideoRenderer::renderPreviewStreamFromAnalysis(const RenderConfig& config, const audio::AudioAnalysisResult& analysis, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel) const {
     const RenderConfig previewConfig = makeFastPreviewConfig(config);
-    if (previewConfig.backgroundImagePath.empty() || previewConfig.lyricPath.empty()) {
-        throw std::runtime_error("背景和歌词都必须选择后才能打开播放器预览");
-    }
     if (analysis.frames.empty()) {
         throw std::runtime_error("播放器预览缺少已预处理的音频驱动数据");
+    }
+    if (isVideoMusicSource(previewConfig.musicPath)) {
+        const int previewFps = std::clamp(previewConfig.previewFps, 12, 60);
+        const double safeStart = std::clamp(startSeconds, 0.0, std::max(0.0, analysis.durationSeconds - 0.05));
+        const double remainingDuration = std::max(0.5, analysis.durationSeconds - safeStart);
+        const double safeDuration = durationSeconds <= 0.0 ? remainingDuration : std::clamp(durationSeconds, 0.5, remainingDuration);
+        const int previewFrames = std::max(1, static_cast<int>(std::ceil(safeDuration * previewFps)));
+        QImage placeholder(std::max(640, previewConfig.previewMaxWidth), std::max(360, previewConfig.previewMaxHeight), QImage::Format_RGB888);
+        placeholder.fill(QColor(20, 15, 31));
+
+        for (int previewIndex = 0; previewIndex < previewFrames; ++previewIndex) {
+            if (shouldCancel && shouldCancel()) {
+                return;
+            }
+            const double timeSeconds = std::min(analysis.durationSeconds, safeStart + static_cast<double>(previewIndex) / static_cast<double>(previewFps));
+            const int frameIndex = std::clamp(static_cast<int>(timeSeconds * previewConfig.fps), 0, static_cast<int>(analysis.frames.size()) - 1);
+            const auto& energy = analysis.frames[std::min<std::size_t>(frameIndex, analysis.frames.size() - 1)];
+            onFrame(placeholder.copy(), previewIndex + 1, previewFrames, energy);
+        }
+        return;
+    }
+    if (previewConfig.backgroundImagePath.empty() || previewConfig.lyricPath.empty()) {
+        throw std::runtime_error("普通音频生成 MV 时，背景和歌词都必须选择后才能打开播放器预览");
     }
 
     cv::Mat background = cv::imread(previewConfig.backgroundImagePath.string(), cv::IMREAD_COLOR);
@@ -1751,8 +1777,11 @@ void VideoRenderer::renderPreviewStreamFromAnalysis(const RenderConfig& config, 
 
 void VideoRenderer::renderPreviewStream(const RenderConfig& config, double startSeconds, double durationSeconds, const PreviewFrameCallback& onFrame, const CancelCallback& shouldCancel) const {
     const RenderConfig previewConfig = makeFastPreviewConfig(config);
-    if (previewConfig.backgroundImagePath.empty() || previewConfig.musicPath.empty() || previewConfig.lyricPath.empty()) {
-        throw std::runtime_error("背景、音乐、歌词都必须选择后才能打开实时预览");
+    if (previewConfig.musicPath.empty()) {
+        throw std::runtime_error("必须选择音乐来源后才能打开实时预览");
+    }
+    if (!isVideoMusicSource(previewConfig.musicPath) && (previewConfig.backgroundImagePath.empty() || previewConfig.lyricPath.empty())) {
+        throw std::runtime_error("普通音频生成 MV 时，背景和歌词都必须选择后才能打开实时预览");
     }
 
     const audio::AudioAnalysisResult analysis = analyzePreviewAudio(config);
