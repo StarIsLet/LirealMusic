@@ -43,7 +43,7 @@ the Free Software Foundation, either version 3 of the License, or
 - WebGPU 后端已全局设为默认渲染模式，并新增 `lireal::render::gpu` 后端查询接口与 `assets/shaders/lireal_effects.wgsl` shader 入口；未链接 Dawn/wgpu-native 时会明确报告 `cpu-opencv-webgpu-fallback`，不会把 NVENC 编码误报成 GPU 合成
 - 自动启发式分离 Lead Vocal、Harmony/Crowd、Bass/Kick、Percussion、Air/Reverb 多轨能量
 - 基于声像、宽度、深度、高度的 2.5D 环绕舞台可视化算法
-- 导出音频使用 7 路 HiFi 双声道 3D 链路：主声、宽声场、后方深度、空气感、高频闪光、低频居中和中频胶合，并自动检测 `firequalizer`，不可用时回退兼容 EQ
+- 导出音频使用清晰取向 HiFi 双声道 3D 链路：保真主声、可控宽场、少量空气感、低频居中和中频胶合；自动检测 `firequalizer`、`stereotools`、`afftdn`、`crystalizer`，不可用时回退兼容处理
 - OpenCV 内存合成视频画面，并通过 FFmpeg rawvideo 管线直接编码，避免逐帧图片落盘
 - 正式渲染采用批量多线程帧合成，再按顺序写入 FFmpeg 管线，避免乱序并提高 2K/4K 吞吐
 - 播放器预览窗口复用同一套内存合成帧，可在渲染前从指定时间点连续播放确认效果；关闭窗口即可停止预览循环

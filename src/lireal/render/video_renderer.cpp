@@ -1284,37 +1284,35 @@ std::string resolveEncoderBackend(const RenderConfig& config) {
 
 std::string makeHifiSurroundFilter(const std::string& inputPad) {
     const std::string hifiPreEq = ffmpegHasFilter("firequalizer")
-        ? "firequalizer=gain_entry='entry(28,-3.2);entry(42,-1.2);entry(64,1.8);entry(110,1.0);entry(240,-1.4);entry(520,-0.6);entry(1200,0.45);entry(3200,1.15);entry(7200,0.9);entry(11200,1.5);entry(16000,0.8)':zero_phase=on:delay=0.018,"
-        : "equalizer=f=64:t=q:w=1.05:g=1.6,equalizer=f=240:t=q:w=1.20:g=-1.1,equalizer=f=3200:t=q:w=1.05:g=1.0,equalizer=f=11200:t=q:w=0.85:g=1.3,";
+        ? "firequalizer=gain_entry='entry(26,-1.8);entry(45,-0.8);entry(72,0.9);entry(120,0.45);entry(250,-0.55);entry(520,-0.35);entry(1500,0.25);entry(3200,0.75);entry(6800,0.55);entry(10500,0.95);entry(15500,0.45)':zero_phase=on:delay=0.012,"
+        : "equalizer=f=72:t=q:w=1.00:g=0.8,equalizer=f=250:t=q:w=1.15:g=-0.5,equalizer=f=3200:t=q:w=1.00:g=0.7,equalizer=f=10500:t=q:w=0.90:g=0.9,";
+    const std::string denoise = ffmpegHasFilter("afftdn") ? "afftdn=nr=5:nf=-72," : "";
+    const std::string crystal = ffmpegHasFilter("crystalizer") ? "crystalizer=i=0.45:c=0," : "";
+    const std::string stereoWidth = ffmpegHasFilter("stereotools")
+        ? "stereotools=mlev=0.98:slev=1.32:base=0.18:delay=5.5:phase=6:softclip=1,"
+        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=1.55:c=0," : "");
     return inputPad + "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-        "highpass=f=22,lowpass=f=20700," + hifiPreEq +
-        "dynaudnorm=f=180:g=10:p=0.56:m=14:s=20,"
-        "asplit=7[dry][wide][air][bass][glue][depth][spark];"
-        "[wide]highpass=f=120,lowpass=f=14200,"
-        "adelay=0|20,"
-        "aecho=0.34:0.44:24|48|86|132:0.12|0.085|0.052|0.032,"
-        "aphaser=in_gain=0.64:out_gain=0.76:delay=2.4:decay=0.34:speed=0.21,"
-        "pan=stereo|c0=0.94*c0-0.10*c1|c1=-0.10*c0+0.94*c1,"
-        "volume=0.86[wide3d];"
-        "[depth]highpass=f=260,lowpass=f=5800,"
-        "adelay=31|43,"
-        "aecho=0.22:0.31:72|118|176:0.07|0.046|0.028,"
-        "volume=0.42[backdepth];"
-        "[air]highpass=f=3900,adelay=13|0,"
-        "aecho=0.24:0.35:38|76|124:0.075|0.052|0.032,"
-        "volume=0.56[air3d];"
-        "[spark]highpass=f=7800,"
-        "aphaser=in_gain=0.38:out_gain=0.52:delay=1.1:decay=0.18:speed=0.37,"
-        "volume=0.24[sparkle];"
-        "[bass]lowpass=f=138,"
-        "pan=stereo|c0=0.68*c0+0.32*c1|c1=0.32*c0+0.68*c1,"
-        "acompressor=threshold=0.42:ratio=1.22:attack=18:release=150:makeup=1.06,"
-        "volume=0.96[basscenter];"
-        "[glue]bandpass=f=980:w=3800,acompressor=threshold=0.16:ratio=1.50:attack=16:release=155:makeup=1.34[body];"
-        "[dry][wide3d][backdepth][air3d][sparkle][basscenter][body]amix=inputs=7:weights=0.80 0.32 0.16 0.13 0.07 0.28 0.17:normalize=0,"
-        "acompressor=threshold=0.70:ratio=1.28:attack=7:release=118:makeup=1.02,"
-        "alimiter=limit=0.955:level=disabled,"
-        "aresample=48000:resampler=soxr:precision=30[aout]";
+        "highpass=f=24,lowpass=f=20500," + denoise + hifiPreEq +
+        "asplit=5[clean][wide][air][bass][body];"
+        "[clean]volume=0.92[dry];"
+        "[wide]highpass=f=180,lowpass=f=13500,"
+        "pan=stereo|c0=0.90*c0-0.16*c1|c1=-0.16*c0+0.90*c1,"
+        + stereoWidth +
+        "volume=0.34[wide3d];"
+        "[air]highpass=f=4200,"
+        "adelay=9|0,"
+        "aecho=0.12:0.18:28|58:0.045|0.026,"
+        "volume=0.13[air3d];"
+        "[bass]lowpass=f=145,"
+        "pan=stereo|c0=0.50*c0+0.50*c1|c1=0.50*c0+0.50*c1,"
+        "volume=0.38[bassmono];"
+        "[body]bandpass=f=950:w=3200,acompressor=threshold=0.24:ratio=1.22:attack=18:release=160:makeup=1.10,"
+        "volume=0.16[bodyglue];"
+        "[dry][wide3d][air3d][bassmono][bodyglue]amix=inputs=5:weights=0.92 0.30 0.10 0.24 0.12:normalize=0,"
+        "acompressor=threshold=0.82:ratio=1.16:attack=12:release=180:makeup=1.00,"
+        + crystal +
+        "alimiter=limit=0.965:level=disabled,"
+        "aresample=48000:resampler=soxr:precision=33[aout]";
 }
 
 void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
