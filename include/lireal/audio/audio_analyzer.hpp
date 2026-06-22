@@ -41,6 +41,11 @@ struct AudioFrameEnergy {
     float transient = 0.0F;
     float spectralFlux = 0.0F;
     float spectralCentroid = 0.0F;
+    float loudness = 0.0F;
+    float dynamicRange = 0.0F;
+    float clarity = 0.0F;
+    float phaseStability = 1.0F;
+    float spatialEnvelopment = 0.0F;
     float beatPulse = 0.0F;
     float dropIntensity = 0.0F;
     float colorMood = 0.0F;
@@ -48,10 +53,27 @@ struct AudioFrameEnergy {
     std::vector<AudioStemEnergy> stems;
 };
 
+struct AudioRepairProfile {
+    float averageLoudness = 0.0F;
+    float averageDynamicRange = 0.0F;
+    float averageClarity = 0.0F;
+    float averagePhaseStability = 1.0F;
+    float averageSpatialEnvelopment = 0.0F;
+    float muddinessRisk = 0.0F;
+    float harshnessRisk = 0.0F;
+    float narrownessRisk = 0.0F;
+    float phaseSmearRisk = 0.0F;
+    float compressionRisk = 0.0F;
+    float suggestedClarity = 0.65F;
+    float suggestedSurround = 0.50F;
+    std::string recommendation;
+};
+
 struct AudioAnalysisResult {
     double durationSeconds = 0.0;
     int sampleRate = 48000;
     int channels = 2;
+    AudioRepairProfile repairProfile;
     std::vector<AudioFrameEnergy> frames;
 };
 

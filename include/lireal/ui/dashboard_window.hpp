@@ -95,6 +95,9 @@ private:
     QComboBox* encoderBackendCombo_ = nullptr;
     QComboBox* encoderDeviceCombo_ = nullptr;
     QComboBox* encoderPresetCombo_ = nullptr;
+    QComboBox* audioEnhancementCombo_ = nullptr;
+    QDoubleSpinBox* audioClaritySpin_ = nullptr;
+    QDoubleSpinBox* surroundStrengthSpin_ = nullptr;
     QSpinBox* encoderCrfSpin_ = nullptr;
     QSpinBox* renderThreadsSpin_ = nullptr;
     QCheckBox* bloomCheck_ = nullptr;

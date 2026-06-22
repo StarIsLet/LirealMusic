@@ -30,6 +30,7 @@ extern "C" {
 #include <complex>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 
 namespace lireal::audio {
@@ -133,6 +134,32 @@ float sampleRmsInRange(const std::vector<float>& samples, int begin, int end) {
         squareSum += static_cast<double>(sample) * static_cast<double>(sample);
     }
     return static_cast<float>(std::sqrt(squareSum / static_cast<double>(std::max(1, safeEnd - safeBegin))));
+}
+
+float crestFactorInRange(const std::vector<float>& samples, int begin, int end) {
+    if (samples.empty() || begin >= end) {
+        return 0.0F;
+    }
+    const int safeBegin = std::clamp(begin, 0, static_cast<int>(samples.size()));
+    const int safeEnd = std::clamp(end, safeBegin, static_cast<int>(samples.size()));
+    double squareSum = 0.0;
+    float peak = 0.0F;
+    for (int index = safeBegin; index < safeEnd; ++index) {
+        const float sample = std::abs(samples[static_cast<std::size_t>(index)]);
+        peak = std::max(peak, sample);
+        squareSum += static_cast<double>(sample) * static_cast<double>(sample);
+    }
+    const float rms = static_cast<float>(std::sqrt(squareSum / static_cast<double>(std::max(1, safeEnd - safeBegin))));
+    return std::clamp((peak / (rms + 0.000001F) - 1.0F) / 7.0F, 0.0F, 1.0F);
+}
+
+float logLoudnessFromRms(float rms) {
+    const float db = 20.0F * std::log10(std::max(rms, 0.000001F));
+    return std::clamp((db + 46.0F) / 34.0F, 0.0F, 1.0F);
+}
+
+float qualityCurve(float value) {
+    return std::clamp(std::pow(std::clamp(value, 0.0F, 1.0F), 0.72F), 0.0F, 1.0F);
 }
 
 } // namespace
@@ -337,6 +364,9 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
         const double correlation = correlationSum / (std::sqrt(leftSquare * rightSquare) + 0.000001);
         const double decorrelationWidth = std::sqrt(std::max(0.0, 1.0 - correlation)) * 0.72;
         energy.stereoWidth = static_cast<float>(std::clamp(std::sqrt(sideSquare) / (std::sqrt(midSquare) + 0.000001) * 0.72 + decorrelationWidth, 0.0, 2.2));
+        energy.phaseStability = static_cast<float>(std::clamp((correlation + 1.0) * 0.5, 0.0, 1.0));
+        energy.loudness = logLoudnessFromRms(energy.rms);
+        energy.dynamicRange = crestFactorInRange(monoSamples, begin, end);
         energy.spectrumBins = makeSpectrumBins(magnitudes, outputSampleRate, dftSize);
 
         double centroidWeighted = 0.0;
@@ -348,6 +378,11 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
             centroidEnergy += magnitude;
         }
         energy.spectralCentroid = static_cast<float>(std::clamp((centroidWeighted / (centroidEnergy + 0.000001)) / 9000.0, 0.0, 1.0));
+        const float presenceBalance = std::clamp(vocalPresence / (energy.mid + energy.treble + 0.000001F), 0.0F, 1.0F);
+        const float mudPenalty = std::clamp(energy.bass / (energy.mid + 0.000001F) * 0.26F, 0.0F, 0.45F);
+        const float harshPenalty = std::clamp(airBand / (energy.mid + 0.000001F) * 0.18F, 0.0F, 0.38F);
+        energy.clarity = qualityCurve(presenceBalance * 0.56F + energy.spectralCentroid * 0.24F + energy.phaseStability * 0.20F - mudPenalty - harshPenalty);
+        energy.spatialEnvelopment = std::clamp(energy.stereoWidth * 0.56F + energy.ambience * 0.26F + (1.0F - energy.phaseStability) * 0.18F, 0.0F, 1.0F);
         double positiveFlux = 0.0;
         double positiveLowFlux = 0.0;
         for (std::size_t bin = 0; bin < energy.spectrumBins.size(); ++bin) {
@@ -457,6 +492,11 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
     float smoothBeatPulse = 0.0F;
     float smoothDropIntensity = 0.0F;
     float smoothColorMood = 0.0F;
+    float smoothLoudness = 0.0F;
+    float smoothDynamicRange = 0.0F;
+    float smoothClarity = 0.0F;
+    float smoothPhaseStability = 1.0F;
+    float smoothSpatialEnvelopment = 0.0F;
     std::vector<float> smoothBins(64, 0.0F);
     for (AudioFrameEnergy& energy : rawFrames) {
         smoothRms = smoothAttackRelease(smoothRms, normalizeEnergy(energy.rms, maxRms, 1.25F), 0.42F, 0.12F);
@@ -473,6 +513,11 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
         smoothBeatPulse = smoothAttackRelease(smoothBeatPulse, punchTarget, 0.92F, 0.10F);
         smoothDropIntensity = smoothAttackRelease(smoothDropIntensity, dropTarget, 0.82F, 0.09F);
         smoothColorMood = smoothAttackRelease(smoothColorMood, energy.colorMood, 0.18F, 0.08F);
+        smoothLoudness = smoothAttackRelease(smoothLoudness, energy.loudness, 0.34F, 0.16F);
+        smoothDynamicRange = smoothAttackRelease(smoothDynamicRange, energy.dynamicRange, 0.46F, 0.18F);
+        smoothClarity = smoothAttackRelease(smoothClarity, energy.clarity, 0.38F, 0.12F);
+        smoothPhaseStability = smoothAttackRelease(smoothPhaseStability, energy.phaseStability, 0.24F, 0.10F);
+        smoothSpatialEnvelopment = smoothAttackRelease(smoothSpatialEnvelopment, energy.spatialEnvelopment, 0.34F, 0.12F);
         energy.rms = smoothRms;
         energy.bass = smoothBass;
         energy.mid = smoothMid;
@@ -485,6 +530,11 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
         energy.beatPulse = smoothBeatPulse;
         energy.dropIntensity = smoothDropIntensity;
         energy.colorMood = smoothColorMood;
+        energy.loudness = smoothLoudness;
+        energy.dynamicRange = smoothDynamicRange;
+        energy.clarity = smoothClarity;
+        energy.phaseStability = smoothPhaseStability;
+        energy.spatialEnvelopment = smoothSpatialEnvelopment;
         energy.stereoWidth = std::clamp(std::pow(std::clamp(energy.stereoWidth * 0.92F, 0.0F, 1.0F), 0.72F), 0.0F, 1.0F);
         for (std::size_t bin = 0; bin < energy.spectrumBins.size(); ++bin) {
             const float normalized = normalizeEnergy(energy.spectrumBins[bin], maxBins[bin], 1.08F);
@@ -538,6 +588,79 @@ AudioAnalysisResult AudioAnalyzer::analyze(const std::filesystem::path& audioPat
             }
         }
         result.frames.push_back(std::move(energy));
+    }
+
+    if (!result.frames.empty()) {
+        double loudnessSum = 0.0;
+        double dynamicSum = 0.0;
+        double claritySum = 0.0;
+        double phaseSum = 0.0;
+        double spatialSum = 0.0;
+        double mudSum = 0.0;
+        double harshSum = 0.0;
+        double narrowSum = 0.0;
+        double phaseRiskSum = 0.0;
+        double compressionSum = 0.0;
+        double vocalSum = 0.0;
+        for (const AudioFrameEnergy& frameEnergy : result.frames) {
+            loudnessSum += frameEnergy.loudness;
+            dynamicSum += frameEnergy.dynamicRange;
+            claritySum += frameEnergy.clarity;
+            phaseSum += frameEnergy.phaseStability;
+            spatialSum += frameEnergy.spatialEnvelopment;
+            mudSum += std::clamp(frameEnergy.bass * 0.72F + frameEnergy.mid * 0.18F - frameEnergy.clarity * 0.34F, 0.0F, 1.0F);
+            harshSum += std::clamp(frameEnergy.treble * 0.70F + frameEnergy.spectralCentroid * 0.34F - frameEnergy.mid * 0.22F, 0.0F, 1.0F);
+            narrowSum += 1.0F - std::clamp(frameEnergy.spatialEnvelopment * 0.72F + frameEnergy.stereoWidth * 0.28F, 0.0F, 1.0F);
+            phaseRiskSum += 1.0F - frameEnergy.phaseStability;
+            compressionSum += std::clamp(frameEnergy.loudness * 0.72F + (1.0F - frameEnergy.dynamicRange) * 0.58F - frameEnergy.transient * 0.20F, 0.0F, 1.0F);
+            vocalSum += frameEnergy.vocal;
+        }
+        const float invCount = 1.0F / static_cast<float>(result.frames.size());
+        AudioRepairProfile profile;
+        profile.averageLoudness = static_cast<float>(loudnessSum) * invCount;
+        profile.averageDynamicRange = static_cast<float>(dynamicSum) * invCount;
+        profile.averageClarity = static_cast<float>(claritySum) * invCount;
+        profile.averagePhaseStability = static_cast<float>(phaseSum) * invCount;
+        profile.averageSpatialEnvelopment = static_cast<float>(spatialSum) * invCount;
+        profile.muddinessRisk = static_cast<float>(mudSum) * invCount;
+        profile.harshnessRisk = static_cast<float>(harshSum) * invCount;
+        profile.narrownessRisk = static_cast<float>(narrowSum) * invCount;
+        profile.phaseSmearRisk = static_cast<float>(phaseRiskSum) * invCount;
+        profile.compressionRisk = static_cast<float>(compressionSum) * invCount;
+        const float vocalPresence = static_cast<float>(vocalSum) * invCount;
+        profile.suggestedClarity = std::clamp(0.58F + profile.muddinessRisk * 0.20F - profile.harshnessRisk * 0.12F + vocalPresence * 0.08F, 0.42F, 0.88F);
+        profile.suggestedSurround = std::clamp(0.48F + profile.narrownessRisk * 0.36F - profile.phaseSmearRisk * 0.22F - profile.harshnessRisk * 0.08F, 0.18F, 1.18F);
+
+        std::ostringstream recommendation;
+        recommendation << "自动画像：";
+        bool hasIssue = false;
+        if (profile.muddinessRisk > 0.50F) {
+            recommendation << "低频偏糊，建议提高清晰度；";
+            hasIssue = true;
+        }
+        if (profile.harshnessRisk > 0.56F) {
+            recommendation << "高频偏刺，建议降低空气感；";
+            hasIssue = true;
+        }
+        if (profile.narrownessRisk > 0.55F) {
+            recommendation << "声场偏窄，可增加环绕；";
+            hasIssue = true;
+        }
+        if (profile.phaseSmearRisk > 0.42F) {
+            recommendation << "相位偏散，环绕不要拉太满；";
+            hasIssue = true;
+        }
+        if (profile.compressionRisk > 0.68F) {
+            recommendation << "动态偏挤，建议保留更多原声锚点；";
+            hasIssue = true;
+        }
+        if (!hasIssue) {
+            recommendation << "整体较稳，适合自然增强。";
+        }
+        recommendation << " 推荐清晰度 " << static_cast<int>(std::round(profile.suggestedClarity * 100.0F))
+                       << "%，环绕 " << static_cast<int>(std::round(profile.suggestedSurround * 100.0F)) << "%";
+        profile.recommendation = recommendation.str();
+        result.repairProfile = std::move(profile);
     }
 
     return result;

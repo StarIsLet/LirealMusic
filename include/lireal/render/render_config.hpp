@@ -35,6 +35,9 @@ struct RenderConfig {
     std::string encoderPreset = "veryfast";
     std::string encoderDevice = "auto";
     std::string renderBackend = "webgpu";
+    std::string audioEnhancementMode = "natural";
+    double audioClarity = 0.62;
+    double surroundStrength = 0.50;
     std::string lyricFontFamily = "loli";
     std::string songTitle = "出山DJ";
     std::string artistName = "花粥";

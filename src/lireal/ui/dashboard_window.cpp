@@ -305,6 +305,16 @@ void DashboardWindow::buildUi() {
     encoderPresetCombo_->addItem(QStringLiteral("均衡 · fast"), QStringLiteral("fast"));
     encoderPresetCombo_->addItem(QStringLiteral("高压缩 · medium"), QStringLiteral("medium"));
     encoderPresetCombo_->setCurrentIndex(1);
+    audioEnhancementCombo_ = new QComboBox;
+    audioEnhancementCombo_->addItem(QStringLiteral("原声清晰 · 轻微增强"), QStringLiteral("natural"));
+    audioEnhancementCombo_->addItem(QStringLiteral("全方位耳机沉浸 · 自动空间"), QStringLiteral("immersive"));
+    audioEnhancementCombo_->addItem(QStringLiteral("人声突出 · 中心清晰"), QStringLiteral("vocal_focus"));
+    audioEnhancementCombo_->addItem(QStringLiteral("强环绕 · 远近包围"), QStringLiteral("surround_plus"));
+    audioEnhancementCombo_->setCurrentIndex(0);
+    audioClaritySpin_ = makeDoubleSpin(0.0, 1.0, 0.62, 0.05, 2);
+    audioClaritySpin_->setToolTip(QStringLiteral("越高越接近清晰原声，越低增强痕迹更多；推荐 0.55~0.75。"));
+    surroundStrengthSpin_ = makeDoubleSpin(0.0, 2.0, 0.50, 0.05, 2);
+    surroundStrengthSpin_->setToolTip(QStringLiteral("环绕叠加强度；默认模式建议 0.30~0.70，强环绕可调到 1.20 以上。"));
     encoderCrfSpin_ = makeSpin(10, 28, 17, 1);
     encoderCrfSpin_->setToolTip(QStringLiteral("数值越小画质越高、文件越大；12 适合 4K 超清，17 适合高画质，20 适合快速预览。"));
     renderThreadsSpin_ = makeSpin(0, 64, 0, 1);
@@ -345,6 +355,9 @@ void DashboardWindow::buildUi() {
     parameterForm->addRow(QStringLiteral("编码后端"), encoderBackendCombo_);
     parameterForm->addRow(QStringLiteral("编码显卡"), encoderDeviceCombo_);
     parameterForm->addRow(QStringLiteral("编码速度"), encoderPresetCombo_);
+    parameterForm->addRow(QStringLiteral("音频增强"), audioEnhancementCombo_);
+    parameterForm->addRow(QStringLiteral("音频清晰度"), audioClaritySpin_);
+    parameterForm->addRow(QStringLiteral("环绕强度"), surroundStrengthSpin_);
     parameterForm->addRow(QStringLiteral("编码 CRF"), encoderCrfSpin_);
     parameterForm->addRow(QStringLiteral("合成线程"), renderThreadsSpin_);
     parameterForm->addRow(QStringLiteral("Bloom"), bloomCheck_);
@@ -512,6 +525,9 @@ void DashboardWindow::saveStylePreset() {
     root.insert(QStringLiteral("encoderBackend"), encoderBackendCombo_->currentData().toString());
     root.insert(QStringLiteral("encoderDevice"), encoderDeviceCombo_->currentData().toString());
     root.insert(QStringLiteral("encoderPreset"), encoderPresetCombo_->currentData().toString());
+    root.insert(QStringLiteral("audioEnhancementMode"), audioEnhancementCombo_->currentData().toString());
+    root.insert(QStringLiteral("audioClarity"), audioClaritySpin_->value());
+    root.insert(QStringLiteral("surroundStrength"), surroundStrengthSpin_->value());
     root.insert(QStringLiteral("encoderCrf"), encoderCrfSpin_->value());
     root.insert(QStringLiteral("renderThreads"), renderThreadsSpin_->value());
     root.insert(QStringLiteral("lyricLayoutMode"), lyricLayoutCombo_->currentIndex());
@@ -582,6 +598,13 @@ void DashboardWindow::loadStylePreset() {
     if (presetIndex >= 0) {
         encoderPresetCombo_->setCurrentIndex(presetIndex);
     }
+    const QString audioEnhancementMode = root.value(QStringLiteral("audioEnhancementMode")).toString(audioEnhancementCombo_->currentData().toString());
+    const int audioIndex = audioEnhancementCombo_->findData(audioEnhancementMode);
+    if (audioIndex >= 0) {
+        audioEnhancementCombo_->setCurrentIndex(audioIndex);
+    }
+    audioClaritySpin_->setValue(root.value(QStringLiteral("audioClarity")).toDouble(audioClaritySpin_->value()));
+    surroundStrengthSpin_->setValue(root.value(QStringLiteral("surroundStrength")).toDouble(surroundStrengthSpin_->value()));
     encoderCrfSpin_->setValue(root.value(QStringLiteral("encoderCrf")).toInt(encoderCrfSpin_->value()));
     renderThreadsSpin_->setValue(root.value(QStringLiteral("renderThreads")).toInt(renderThreadsSpin_->value()));
     lyricLayoutCombo_->setCurrentIndex(std::clamp(root.value(QStringLiteral("lyricLayoutMode")).toInt(lyricLayoutCombo_->currentIndex()), 0, lyricLayoutCombo_->count() - 1));
@@ -974,7 +997,7 @@ void DashboardWindow::generatePreview() {
 
             lireal::render::VideoRenderer renderer;
             const auto analysis = renderer.analyzePreviewAudio(config);
-            QMetaObject::invokeMethod(this, [dialogGuard, labelGuard, audioPanelGuard, duration = analysis.durationSeconds, videoAudioOnlyMode]() {
+            QMetaObject::invokeMethod(this, [dialogGuard, labelGuard, audioPanelGuard, duration = analysis.durationSeconds, recommendation = QString::fromStdString(analysis.repairProfile.recommendation), videoAudioOnlyMode]() {
                 if (!dialogGuard.isNull() && !labelGuard.isNull()) {
                     labelGuard->setText(videoAudioOnlyMode
                         ? QStringLiteral("音频已就绪：原视频画面保持不变，导出时只替换增强音轨")
@@ -982,8 +1005,8 @@ void DashboardWindow::generatePreview() {
                 }
                 if (!audioPanelGuard.isNull()) {
                     audioPanelGuard->setText(videoAudioOnlyMode
-                        ? QStringLiteral("🎧 视频音频处理状态\n\n音频预处理完成：%1 秒\n视频画面不会重新生成，导出时只处理声音喵…").arg(duration, 0, 'f', 1)
-                        : QStringLiteral("🎧 音频处理状态\n\n音频预处理完成：%1 秒\n正在启动画面播放器循环喵…").arg(duration, 0, 'f', 1));
+                        ? QStringLiteral("🎧 视频音频处理状态\n\n音频预处理完成：%1 秒\n%2\n视频画面不会重新生成，导出时只处理声音喵…").arg(duration, 0, 'f', 1).arg(recommendation)
+                        : QStringLiteral("🎧 音频处理状态\n\n音频预处理完成：%1 秒\n%2\n正在启动画面播放器循环喵…").arg(duration, 0, 'f', 1).arg(recommendation));
                 }
             }, Qt::QueuedConnection);
             renderer.renderPreviewStreamFromAnalysis(config, analysis, previewTimeSeconds, previewDurationSeconds, [this, dialogGuard, labelGuard, audioPanelGuard, cancelPreview, previewFps = std::clamp(config.previewFps, 12, 60)](const QImage& image, int current, int total, const lireal::audio::AudioFrameEnergy& energy) {
@@ -1062,8 +1085,12 @@ QString DashboardWindow::describeAudioEnergy(const lireal::audio::AudioFrameEner
         "氛围    %10\n\n"
         "Beat    %11\n"
         "Drop    %12\n"
-        "声场宽度 %13\n\n"
-        "🌸 分轨 / 3D声场%14")
+        "声场宽度 %13\n"
+        "清晰度  %14\n"
+        "动态    %15\n"
+        "相位稳定 %16\n"
+        "包围感  %17\n\n"
+        "🌸 分轨 / 3D声场%18")
         .arg(current)
         .arg(total)
         .arg(energy.timeSeconds, 0, 'f', 2)
@@ -1077,6 +1104,10 @@ QString DashboardWindow::describeAudioEnergy(const lireal::audio::AudioFrameEner
         .arg(bar(energy.beatPulse))
         .arg(bar(energy.dropIntensity))
         .arg(bar(energy.stereoWidth))
+        .arg(bar(energy.clarity))
+        .arg(bar(energy.dynamicRange))
+        .arg(bar(energy.phaseStability))
+        .arg(bar(energy.spatialEnvelopment))
         .arg(stems);
 }
 
@@ -1101,6 +1132,9 @@ lireal::render::RenderConfig DashboardWindow::collectConfig() const {
     config.encoderBackend = encoderBackendCombo_->currentData().toString().toStdString();
     config.encoderDevice = encoderDeviceCombo_->currentData().toString().toStdString();
     config.encoderPreset = encoderPresetCombo_->currentData().toString().toStdString();
+    config.audioEnhancementMode = audioEnhancementCombo_->currentData().toString().toStdString();
+    config.audioClarity = audioClaritySpin_->value();
+    config.surroundStrength = surroundStrengthSpin_->value();
     config.encoderCrf = encoderCrfSpin_->value();
     config.renderBackend = "webgpu";
     config.renderThreads = renderThreadsSpin_->value();

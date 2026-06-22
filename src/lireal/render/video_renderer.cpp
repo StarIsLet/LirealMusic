@@ -39,11 +39,14 @@
 #include <initializer_list>
 #include <list>
 #include <mutex>
+#include <numbers>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #if LIREAL_HAS_OPENMP
 #include <omp.h>
@@ -1282,47 +1285,359 @@ std::string resolveEncoderBackend(const RenderConfig& config) {
     return "libx264";
 }
 
-std::string makeHifiSurroundFilter(const std::string& inputPad) {
-    const std::string hifiPreEq = ffmpegHasFilter("firequalizer")
-        ? "firequalizer=gain_entry='entry(24,-2.0);entry(38,-0.9);entry(64,0.9);entry(95,0.55);entry(180,-0.25);entry(300,-0.65);entry(620,-0.35);entry(1250,0.20);entry(2600,0.58);entry(4200,0.75);entry(7600,0.55);entry(10800,0.85);entry(15500,0.38)':zero_phase=on:delay=0.012,"
-        : "equalizer=f=64:t=q:w=1.00:g=0.8,equalizer=f=300:t=q:w=1.15:g=-0.6,equalizer=f=2600:t=q:w=1.00:g=0.55,equalizer=f=10800:t=q:w=0.90:g=0.8,";
-    const std::string denoise = ffmpegHasFilter("afftdn") ? "afftdn=nr=5:nf=-72," : "";
-    const std::string crystal = ffmpegHasFilter("crystalizer") ? "crystalizer=i=0.38:c=0," : "";
-    const std::string headphoneGlue = ffmpegHasFilter("crossfeed") ? "crossfeed=strength=0.18:range=0.72:slope=0.42:level_in=0.96:level_out=1.0," : "";
-    const std::string nearWidth = ffmpegHasFilter("stereotools")
-        ? "stereotools=mlev=0.99:slev=1.22:base=0.13:delay=3.6:phase=3.5:softclip=1,"
-        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=1.32:c=0," : "");
-    const std::string farWidth = ffmpegHasFilter("stereotools")
-        ? "stereotools=mlev=0.96:slev=1.45:base=0.24:delay=7.8:phase=8.0:softclip=1,"
-        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=1.72:c=0," : "");
-    return inputPad + "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-        "highpass=f=23,lowpass=f=20500," + denoise + hifiPreEq +
-        "asplit=15[main][center][sub][punch][warm][presence][sparkle][air][leftnear][rightnear][leftfar][rightfar][front][rear][ceiling];"
-        "[main]volume=0.74[mainout];"
-        "[center]highpass=f=120,lowpass=f=4200,pan=stereo|c0=0.54*c0+0.46*c1|c1=0.46*c0+0.54*c1,volume=0.30[centerout];"
-        "[sub]lowpass=f=105,pan=stereo|c0=0.50*c0+0.50*c1|c1=0.50*c0+0.50*c1,volume=0.22[subout];"
-        "[punch]highpass=f=70,lowpass=f=185,acompressor=threshold=0.30:ratio=1.28:attack=12:release=140:makeup=1.05,volume=0.14[punchout];"
-        "[warm]bandpass=f=420:w=520,volume=0.12[warmout];"
-        "[presence]bandpass=f=2350:w=2800,acompressor=threshold=0.22:ratio=1.18:attack=10:release=120:makeup=1.06,volume=0.11[presenceout];"
-        "[sparkle]highpass=f=7800," + crystal + "volume=0.075[sparkleout];"
-        "[air]highpass=f=5200,adelay=11|0,aecho=0.08:0.13:34|67:0.030|0.018,volume=0.070[airout];"
-        "[leftnear]highpass=f=170,lowpass=f=12000,adelay=0|5,pan=stereo|c0=1.00*c0+0.06*c1|c1=0.18*c0+0.54*c1," + nearWidth + "volume=0.16[leftnearout];"
-        "[rightnear]highpass=f=170,lowpass=f=12000,adelay=5|0,pan=stereo|c0=0.54*c0+0.18*c1|c1=0.06*c0+1.00*c1," + nearWidth + "volume=0.16[rightnearout];"
-        "[leftfar]highpass=f=260,lowpass=f=9800,adelay=0|15,pan=stereo|c0=0.92*c0-0.18*c1|c1=0.15*c0+0.48*c1," + farWidth + "volume=0.12[leftfarout];"
-        "[rightfar]highpass=f=260,lowpass=f=9800,adelay=15|0,pan=stereo|c0=0.48*c0+0.15*c1|c1=-0.18*c0+0.92*c1," + farWidth + "volume=0.12[rightfarout];"
-        "[front]highpass=f=220,lowpass=f=7000,pan=stereo|c0=0.60*c0+0.40*c1|c1=0.40*c0+0.60*c1,adelay=3|3,volume=0.105[frontout];"
-        "[rear]highpass=f=320,lowpass=f=6200,adelay=24|31,aecho=0.10:0.16:82|137:0.032|0.018,pan=stereo|c0=0.78*c1|c1=0.78*c0,volume=0.090[rearout];"
-        "[ceiling]highpass=f=6200,adelay=7|13,aecho=0.07:0.11:43|91:0.024|0.014,volume=0.055[ceilingout];"
-        "[mainout][centerout][subout][punchout][warmout][presenceout][sparkleout][airout][leftnearout][rightnearout][leftfarout][rightfarout][frontout][rearout][ceilingout]"
-        "amix=inputs=15:weights=0.78 0.24 0.18 0.12 0.09 0.09 0.055 0.052 0.12 0.12 0.090 0.090 0.075 0.060 0.040:normalize=0,"
-        + headphoneGlue +
-        "acompressor=threshold=0.84:ratio=1.13:attack=16:release=210:makeup=1.00,"
-        "alimiter=limit=0.962:attack=3:release=95:level=disabled,"
-        "aresample=48000:resampler=soxr:precision=33[aout]";
+std::string formatNumber(double value, int precision = 3) {
+    std::ostringstream stream;
+    stream.setf(std::ios::fixed, std::ios::floatfield);
+    stream.precision(precision);
+    stream << value;
+    std::string text = stream.str();
+    while (text.size() > 1 && text.back() == '0') {
+        text.pop_back();
+    }
+    if (!text.empty() && text.back() == '.') {
+        text.pop_back();
+    }
+    return text;
 }
 
-void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
-    const std::string surroundFilter = makeHifiSurroundFilter("[1:a]");
+struct VirtualSpatialSource {
+    std::string name;
+    double azimuthDegrees = 0.0;
+    double distanceMeters = 1.0;
+    double elevationDegrees = 0.0;
+    double gain = 0.1;
+    int lowCutHz = 20;
+    int highCutHz = 20000;
+    double width = 0.0;
+    bool invertOpposite = false;
+    bool monoize = false;
+    bool addReflection = false;
+    double motionHz = 0.0;
+    double motionAmount = 0.0;
+    double motionOffset = 0.0;
+};
+
+std::string makePanForSource(const VirtualSpatialSource& source) {
+    if (source.monoize) {
+        return "pan=stereo|c0=0.50*c0+0.50*c1|c1=0.50*c0+0.50*c1,";
+    }
+
+    const double wrappedDegrees = std::remainder(source.azimuthDegrees, 360.0);
+    const double azimuth = wrappedDegrees * std::numbers::pi / 180.0;
+    const double side = std::sin(azimuth);
+    const double front = std::cos(azimuth);
+    const double rear = std::max(0.0, -front);
+    const double distance = std::clamp(source.distanceMeters, 0.45, 3.2);
+    const double elevation = std::clamp(std::abs(source.elevationDegrees) / 90.0, 0.0, 1.0);
+
+    // IID：耳间电平差保留方向感；背后声源允许更明显绕后，但主体不会参与远场。
+    const double iid = std::clamp(side * (0.52 - 0.08 * rear) / std::sqrt(distance), -0.58, 0.58);
+    const double centerBlend = std::clamp(0.18 + 0.22 * std::max(0.0, front) + 0.08 * rear + 0.05 * elevation, 0.10, 0.48);
+    const double cross = std::clamp(centerBlend - std::abs(side) * 0.08, 0.06, 0.44);
+    const double rearDamping = 1.0 - rear * 0.10;
+    const double leftMain = std::clamp((0.78 - iid) * rearDamping, 0.24, 1.18);
+    const double rightMain = std::clamp((0.78 + iid) * rearDamping, 0.24, 1.18);
+    const double anti = source.invertOpposite ? -0.11 * std::abs(side) : 0.0;
+
+    std::ostringstream pan;
+    pan << "pan=stereo|c0=" << formatNumber(leftMain) << "*c0";
+    pan << (cross + anti < 0.0 ? "" : "+") << formatNumber(cross + anti) << "*c1";
+    pan << "|c1=" << formatNumber(cross + anti) << "*c0+" << formatNumber(rightMain) << "*c1,";
+    return pan.str();
+}
+
+std::string makeSpatialSourceFilter(const VirtualSpatialSource& source, const std::string& widthFilter) {
+    const double wrappedDegrees = std::remainder(source.azimuthDegrees, 360.0);
+    const double azimuth = wrappedDegrees * std::numbers::pi / 180.0;
+    const double side = std::sin(azimuth);
+    const double front = std::cos(azimuth);
+    const double rear = std::max(0.0, -front);
+    const double distance = std::clamp(source.distanceMeters, 0.45, 3.2);
+    const double elevation = std::clamp(source.elevationDegrees / 90.0, -1.0, 1.0);
+
+    // ITD + Haas：主体层保持近场，侧后方层给更明确的方位和绕后感。
+    const double lateralMs = side * 0.58;
+    const double depthMs = std::min(8.5, std::max(0.0, distance - 0.68) * 1.05 + rear * 3.05 + std::abs(elevation) * 0.92);
+    const int leftDelay = static_cast<int>(std::round(std::max(0.0, lateralMs + depthMs)));
+    const int rightDelay = static_cast<int>(std::round(std::max(0.0, -lateralMs + depthMs)));
+    const double distanceGain = source.gain / std::pow(distance, 0.30);
+    const double elevationAir = 1.0 + std::max(0.0, elevation) * 0.16;
+    const int highCut = std::clamp(static_cast<int>(source.highCutHz - rear * 1220.0 - std::max(0.0, distance - 1.0) * 260.0 - std::max(0.0, -elevation) * 360.0), 5600, 20500);
+    const int lowCut = std::clamp(static_cast<int>(source.lowCutHz + rear * 14.0 + std::max(0.0, distance - 1.0) * 8.0), 20, 12000);
+
+    std::ostringstream filter;
+    filter << "[" << source.name << "]";
+    if (lowCut > 20) {
+        filter << "highpass=f=" << lowCut << ',';
+    }
+    if (highCut < 20500) {
+        filter << "lowpass=f=" << highCut << ',';
+    }
+    filter << "adelay=" << leftDelay << '|' << rightDelay << ',';
+    filter << makePanForSource(source);
+    if (source.width > 0.01 && !widthFilter.empty()) {
+        filter << widthFilter;
+    }
+    if (source.addReflection) {
+        const int reflectionA = static_cast<int>(std::round(10 + distance * 7 + rear * 20 + std::max(0.0, elevation) * 6));
+        const int reflectionB = static_cast<int>(std::round(18 + distance * 10 + std::abs(elevation) * 14 + std::abs(side) * 8));
+        filter << "aecho=0.035:0.070:" << reflectionA << '|' << reflectionB << ":0.015|0.009,";
+    }
+    if (source.motionHz > 0.001 && source.motionAmount > 0.001 && ffmpegHasFilter("apulsator")) {
+        const double safeAmount = std::clamp(source.motionAmount, 0.0, 0.82);
+        const double safeHz = std::clamp(source.motionHz, 0.01, 0.72);
+        const double leftOffset = std::clamp(source.motionOffset, 0.0, 1.0);
+        const double rightOffset = std::fmod(leftOffset + 0.50, 1.0);
+        filter << "apulsator=mode=sine:timing=hz:hz=" << formatNumber(safeHz, 4)
+               << ":amount=" << formatNumber(safeAmount, 4)
+               << ":offset_l=" << formatNumber(leftOffset, 4)
+               << ":offset_r=" << formatNumber(rightOffset, 4)
+               << ":width=1.0:level_in=1.0:level_out=1.0,";
+    }
+    filter << "volume=" << formatNumber(distanceGain * elevationAir, 4) << '[' << source.name << "out];";
+    return filter.str();
+}
+
+std::string makeNaturalHifiFilter(const std::string& inputPad, const RenderConfig& config) {
+    const double clarity = std::clamp(config.audioClarity, 0.0, 1.0);
+    const double surround = std::clamp(config.surroundStrength, 0.0, 2.0);
+    const double enhanceAmount = std::clamp(0.22 - clarity * 0.10 + surround * 0.035, 0.07, 0.30);
+    const double dryAmount = std::clamp(0.88 + clarity * 0.11 - surround * 0.020, 0.80, 0.99);
+    const double focusAmount = std::clamp(0.055 + clarity * 0.075, 0.04, 0.15);
+    const double bassAmount = std::clamp(0.055 + (1.0 - clarity) * 0.035, 0.04, 0.10);
+    const double airAmount = std::clamp(surround * 0.040 + (1.0 - clarity) * 0.020, 0.0, 0.10);
+    const double eqScale = std::clamp(0.38 + (1.0 - clarity) * 0.48, 0.30, 0.90);
+    const double widthScale = std::clamp(0.32 + surround * 0.38 - clarity * 0.16, 0.12, 0.95);
+
+    std::ostringstream eq;
+    if (ffmpegHasFilter("firequalizer")) {
+        eq << "firequalizer=gain_entry='entry(24," << formatNumber(-0.65 * eqScale)
+           << ");entry(42," << formatNumber(-0.20 * eqScale)
+           << ");entry(72," << formatNumber(0.28 * eqScale)
+           << ");entry(180," << formatNumber(-0.05 * eqScale)
+           << ");entry(320," << formatNumber(-0.12 * eqScale)
+           << ");entry(1100," << formatNumber(0.04 * eqScale)
+           << ");entry(2600," << formatNumber(0.09 * eqScale)
+           << ");entry(5600," << formatNumber(0.07 * eqScale)
+           << ");entry(10500," << formatNumber(0.10 * eqScale)
+           << ")':zero_phase=on:delay=0.006,";
+    } else {
+        eq << "equalizer=f=72:t=q:w=1.00:g=" << formatNumber(0.28 * eqScale)
+           << ",equalizer=f=320:t=q:w=1.10:g=" << formatNumber(-0.12 * eqScale)
+           << ",equalizer=f=2600:t=q:w=1.00:g=" << formatNumber(0.09 * eqScale) << ',';
+    }
+    const std::string denoise = ffmpegHasFilter("afftdn") ? "afftdn=nr=2:nf=-80," : "";
+    std::ostringstream width;
+    if (ffmpegHasFilter("stereotools")) {
+        width << "stereotools=mlev=1.00:slev=" << formatNumber(1.0 + 0.050 * widthScale)
+              << ":base=" << formatNumber(0.018 * widthScale)
+              << ":delay=" << formatNumber(0.40 * widthScale)
+              << ":phase=" << formatNumber(0.22 * widthScale)
+              << ":softclip=1,";
+    } else if (ffmpegHasFilter("extrastereo")) {
+        width << "extrastereo=m=" << formatNumber(1.0 + 0.040 * widthScale) << ":c=0,";
+    }
+
+    std::ostringstream filter;
+    filter << inputPad
+           << "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+           << "highpass=f=20,lowpass=f=20500,asplit=5[dry][enh][focus][bass][air];"
+           << "[dry]volume=" << formatNumber(dryAmount, 4) << "[dryout];"
+           << "[enh]" << denoise << eq.str() << width.str()
+           << "acompressor=threshold=0.955:ratio=1.015:attack=30:release=190:makeup=1.00,"
+           << "volume=" << formatNumber(enhanceAmount, 4) << "[enhout];"
+           << "[focus]highpass=f=520,lowpass=f=4200,"
+           << "acompressor=threshold=0.93:ratio=1.035:attack=18:release=150:makeup=1.00,"
+           << "volume=" << formatNumber(focusAmount, 4) << "[focusout];"
+           << "[bass]lowpass=f=145,pan=stereo|c0=0.50*c0+0.50*c1|c1=0.50*c0+0.50*c1,"
+           << "volume=" << formatNumber(bassAmount, 4) << "[bassout];"
+           << "[air]highpass=f=7600," << width.str()
+           << "volume=" << formatNumber(airAmount, 4) << "[airout];"
+           << "[dryout][enhout][focusout][bassout][airout]amix=inputs=5:normalize=0,"
+           << "alimiter=limit=0.97:attack=3:release=90:level=disabled,"
+           << "aresample=48000:resampler=soxr:precision=33[aout]";
+    return filter.str();
+}
+
+std::string makeImmersivePanoramaFilter(const std::string& inputPad, const RenderConfig& config) {
+    const double clarity = std::clamp(config.audioClarity, 0.0, 1.0);
+    const double userSurround = std::clamp(config.surroundStrength, 0.0, 2.0);
+    const double panoramaDrive = std::clamp(0.92 + userSurround * 0.92 - clarity * 0.08, 0.80, 2.65);
+    const double dryAnchor = std::clamp(0.56 + clarity * 0.18 - panoramaDrive * 0.064, 0.40, 0.70);
+    const double centerGain = std::clamp(0.59 + clarity * 0.14, 0.56, 0.74);
+    const double sideGain = panoramaDrive * 1.18;
+    const double rearGain = panoramaDrive * 1.16;
+    const double heightGain = panoramaDrive * 1.02;
+    const double airGain = panoramaDrive * std::clamp(1.12 - clarity * 0.16, 0.82, 1.12);
+
+    const std::string hifiPreEq = ffmpegHasFilter("firequalizer")
+        ? "firequalizer=gain_entry='entry(24,-1.4);entry(46,-0.4);entry(72,0.55);entry(150,0.18);entry(280,-0.35);entry(720,-0.10);entry(1800,0.16);entry(3300,0.32);entry(6200,0.22);entry(9500,0.30);entry(14500,0.16)':zero_phase=on:delay=0.010,"
+        : "equalizer=f=72:t=q:w=1.00:g=0.55,equalizer=f=280:t=q:w=1.10:g=-0.35,equalizer=f=3300:t=q:w=1.00:g=0.32,equalizer=f=9500:t=q:w=0.95:g=0.30,";
+    const std::string denoise = ffmpegHasFilter("afftdn") ? "afftdn=nr=3:nf=-76," : "";
+    const std::string glue = ffmpegHasFilter("crossfeed") ? "crossfeed=strength=0.105:range=0.70:slope=0.42:level_in=0.98:level_out=1.0," : "";
+    const std::string nearWidth = ffmpegHasFilter("stereotools")
+        ? "stereotools=mlev=1.00:slev=" + formatNumber(1.20 + panoramaDrive * 0.13) + ":base=" + formatNumber(0.10 + panoramaDrive * 0.026) + ":delay=" + formatNumber(1.8 + panoramaDrive * 0.40) + ":phase=" + formatNumber(1.3 + panoramaDrive * 0.42) + ":softclip=1,"
+        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=" + formatNumber(1.22 + panoramaDrive * 0.10) + ":c=0," : "");
+    const std::string farWidth = ffmpegHasFilter("stereotools")
+        ? "stereotools=mlev=1.00:slev=" + formatNumber(1.46 + panoramaDrive * 0.18) + ":base=" + formatNumber(0.20 + panoramaDrive * 0.040) + ":delay=" + formatNumber(3.7 + panoramaDrive * 0.70) + ":phase=" + formatNumber(2.8 + panoramaDrive * 0.78) + ":softclip=1,"
+        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=" + formatNumber(1.44 + panoramaDrive * 0.14) + ":c=0," : "");
+
+    const std::vector<VirtualSpatialSource> sources {
+        {"center", 0.0, 0.58, 0.0, centerGain, 24, 20500, 0.0, false, false, false},
+        {"vocalcenter", 0.0, 0.50, 2.0, 0.105 * centerGain, 180, 6200, 0.0, false, true, false},
+        {"centerpresence", 0.0, 0.54, 6.0, 0.092 * centerGain, 700, 5600, 0.0, false, false, false, 0.040, 0.070, 0.50},
+        {"vocaldriftleft", -14.0, 0.60, 5.0, 0.030 * centerGain, 260, 5400, 0.04, false, false, false, 0.055, 0.145, 0.25},
+        {"vocaldriftright", 14.0, 0.60, 5.0, 0.034 * centerGain, 260, 5400, 0.04, false, false, false, 0.055, 0.145, 0.75},
+        {"vocalheight", 0.0, 0.66, 24.0, 0.026 * centerGain, 1200, 6800, 0.04, false, false, false, 0.040, 0.100, 0.50},
+        {"subcenter", 0.0, 0.78, -16.0, 0.16, 20, 115, 0.0, false, true, false},
+        {"warmfront", 0.0, 0.72, -5.0, 0.060, 140, 760, 0.0, false, false, false},
+        {"frontleft", -28.0, 0.64, 6.0, 0.060 * sideGain, 180, 11800, 0.06, false, false, false},
+        {"frontright", 28.0, 0.64, 6.0, 0.060 * sideGain, 180, 11800, 0.06, false, false, false},
+        {"shoulderleft", -54.0, 0.58, 2.0, 0.074 * sideGain, 220, 13000, 0.08, false, false, false},
+        {"shoulderright", 54.0, 0.58, 2.0, 0.074 * sideGain, 220, 13000, 0.08, false, false, false},
+        {"sideleft", -88.0, 0.72, 0.0, 0.110 * sideGain, 260, 11600, 0.17, true, false, false, 0.115, 0.360, 0.02},
+        {"sideright", 88.0, 0.72, 0.0, 0.110 * sideGain, 260, 11600, 0.17, true, false, false, 0.115, 0.360, 0.52},
+        {"orbitfrontleft", -58.0, 0.70, 16.0, 0.058 * sideGain, 1400, 15000, 0.13, false, false, false, 0.170, 0.540, 0.08},
+        {"orbitfrontright", 58.0, 0.70, 16.0, 0.058 * sideGain, 1400, 15000, 0.13, false, false, false, 0.170, 0.540, 0.58},
+        {"orbitmidleft", -102.0, 0.86, 8.0, 0.052 * sideGain, 900, 12500, 0.18, true, false, true, 0.145, 0.500, 0.23},
+        {"orbitmidright", 102.0, 0.86, 8.0, 0.052 * sideGain, 900, 12500, 0.18, true, false, true, 0.145, 0.500, 0.73},
+        {"rearleft", -130.0, 0.90, -4.0, 0.084 * rearGain, 340, 9400, 0.20, true, false, true, 0.105, 0.330, 0.30},
+        {"rearright", 130.0, 0.90, -4.0, 0.084 * rearGain, 340, 9400, 0.20, true, false, true, 0.105, 0.330, 0.80},
+        {"orbitrearleft", -150.0, 1.02, 10.0, 0.060 * rearGain, 700, 9800, 0.22, true, false, true, 0.120, 0.480, 0.40},
+        {"orbitrearright", 150.0, 1.02, 10.0, 0.060 * rearGain, 700, 9800, 0.22, true, false, true, 0.120, 0.480, 0.90},
+        {"deeprearleft", -166.0, 1.16, -10.0, 0.048 * rearGain, 420, 7800, 0.24, true, false, true, 0.070, 0.260, 0.38},
+        {"deeprearright", 166.0, 1.16, -10.0, 0.048 * rearGain, 420, 7800, 0.24, true, false, true, 0.070, 0.260, 0.88},
+        {"ceilleft", -46.0, 0.82, 62.0, 0.052 * heightGain, 4800, 18200, 0.14, false, false, true, 0.090, 0.340, 0.20},
+        {"ceilright", 46.0, 0.82, 62.0, 0.052 * heightGain, 4800, 18200, 0.14, false, false, true, 0.090, 0.340, 0.70},
+        {"ceilrearleft", -132.0, 1.00, 48.0, 0.034 * heightGain, 5000, 16500, 0.18, true, false, true, 0.080, 0.320, 0.34},
+        {"ceilrearright", 132.0, 1.00, 48.0, 0.034 * heightGain, 5000, 16500, 0.18, true, false, true, 0.080, 0.320, 0.84},
+        {"topair", 0.0, 0.94, 72.0, 0.042 * airGain, 6800, 19000, 0.10, false, false, true, 0.065, 0.240, 0.44},
+        {"lowleft", -36.0, 0.84, -42.0, 0.030 * sideGain, 70, 240, 0.04, false, true, false},
+        {"lowright", 36.0, 0.84, -42.0, 0.030 * sideGain, 70, 240, 0.04, false, true, false},
+        {"sparkleleft", -70.0, 0.76, 28.0, 0.052 * airGain, 7600, 19000, 0.14, false, false, false, 0.180, 0.620, 0.10},
+        {"sparkleright", 70.0, 0.76, 28.0, 0.052 * airGain, 7600, 19000, 0.14, false, false, false, 0.180, 0.620, 0.60},
+        {"sparklerearleft", -142.0, 1.02, 32.0, 0.038 * airGain, 8200, 18800, 0.20, true, false, true, 0.140, 0.520, 0.32},
+        {"sparklerearright", 142.0, 1.02, 32.0, 0.038 * airGain, 8200, 18800, 0.20, true, false, true, 0.140, 0.520, 0.82},
+        {"roomleft", -112.0, 1.02, 16.0, 0.046 * rearGain, 1200, 10500, 0.18, true, false, true, 0.060, 0.240, 0.25},
+        {"roomright", 112.0, 1.02, 16.0, 0.046 * rearGain, 1200, 10500, 0.18, true, false, true, 0.060, 0.240, 0.75},
+    };
+
+    std::ostringstream filter;
+    filter << inputPad << "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+           << "highpass=f=22,lowpass=f=20500," << denoise << hifiPreEq
+           << "asplit=" << (sources.size() + 1) << "[dryanchor]";
+    for (const auto& source : sources) {
+        filter << '[' << source.name << ']';
+    }
+    filter << ';';
+
+    filter << "[dryanchor]volume=" << formatNumber(dryAnchor, 4) << "[dryanchorout];";
+    for (const auto& source : sources) {
+        const bool farOrWide = source.width > 0.10 || std::abs(source.azimuthDegrees) > 70.0 || source.addReflection;
+        filter << makeSpatialSourceFilter(source, farOrWide ? farWidth : nearWidth);
+    }
+
+    filter << "[dryanchorout]";
+    for (const auto& source : sources) {
+        filter << '[' << source.name << "out]";
+    }
+    filter << "amix=inputs=" << (sources.size() + 1) << ":normalize=0,"
+           << "pan=stereo|c0=0.992*c0|c1=1.018*c1,"
+           << "acompressor=threshold=0.93:ratio=1.035:attack=22:release=210:makeup=1.00,"
+           << glue
+           << "alimiter=limit=0.96:attack=3:release=105:level=disabled,"
+           << "aresample=48000:resampler=soxr:precision=33[aout]";
+    return filter.str();
+}
+
+std::string makeHifiSurroundFilter(const std::string& inputPad, const RenderConfig& config) {
+    if (config.audioEnhancementMode == "natural") {
+        return makeNaturalHifiFilter(inputPad, config);
+    }
+    if (config.audioEnhancementMode == "immersive") {
+        return makeImmersivePanoramaFilter(inputPad, config);
+    }
+
+    const double clarity = std::clamp(config.audioClarity, 0.0, 1.0);
+    const double userSurround = std::clamp(config.surroundStrength, 0.0, 2.0);
+    const bool vocalFocus = config.audioEnhancementMode == "vocal_focus";
+    const bool surroundPlus = config.audioEnhancementMode == "surround_plus";
+    const bool immersive = config.audioEnhancementMode == "immersive";
+    const double modeDrive = surroundPlus ? 1.34 : (immersive ? 1.16 : 0.88);
+    const double spatialScale = std::clamp(userSurround * modeDrive * (1.08 - clarity * 0.30), 0.0, 2.6);
+    const double dryAnchor = std::clamp(0.68 + clarity * 0.30 - spatialScale * 0.045 - (surroundPlus ? 0.05 : 0.0) + (immersive ? 0.025 : 0.0), 0.55, 0.95);
+    const double glueStrength = std::clamp(0.13 - userSurround * 0.018 + clarity * 0.020 + (immersive ? 0.012 : 0.0), 0.055, 0.17);
+    const double crystalAmount = std::clamp(0.18 + (1.0 - clarity) * 0.10, 0.12, 0.30);
+
+    const std::string hifiPreEq = ffmpegHasFilter("firequalizer")
+        ? "firequalizer=gain_entry='entry(24,-1.6);entry(38,-0.7);entry(64,0.7);entry(95,0.45);entry(180,-0.15);entry(300,-0.45);entry(620,-0.18);entry(1250,0.10);entry(2600,0.28);entry(4200,0.36);entry(7600,0.36);entry(10800,0.55);entry(15500,0.26)':zero_phase=on:delay=0.012,"
+        : "equalizer=f=64:t=q:w=1.00:g=0.7,equalizer=f=300:t=q:w=1.15:g=-0.45,equalizer=f=2600:t=q:w=1.00:g=0.28,equalizer=f=10800:t=q:w=0.90:g=0.55,";
+    const std::string denoise = ffmpegHasFilter("afftdn") ? "afftdn=nr=4:nf=-74," : "";
+    const std::string crystal = ffmpegHasFilter("crystalizer") ? "crystalizer=i=" + formatNumber(crystalAmount) + ":c=0," : "";
+    const std::string headphoneGlue = ffmpegHasFilter("crossfeed") ? "crossfeed=strength=" + formatNumber(glueStrength) + ":range=0.62:slope=0.36:level_in=0.98:level_out=1.0," : "";
+    const std::string nearWidth = ffmpegHasFilter("stereotools")
+        ? "stereotools=mlev=1.00:slev=" + formatNumber(1.12 + spatialScale * 0.11) + ":base=" + formatNumber(0.07 + spatialScale * 0.020) + ":delay=" + formatNumber(1.7 + spatialScale * 0.38) + ":phase=" + formatNumber(1.2 + spatialScale * 0.42) + ":softclip=1,"
+        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=" + formatNumber(1.14 + spatialScale * 0.10) + ":c=0," : "");
+    const std::string farWidth = ffmpegHasFilter("stereotools")
+        ? "stereotools=mlev=1.00:slev=" + formatNumber(1.30 + spatialScale * 0.16) + ":base=" + formatNumber(0.13 + spatialScale * 0.040) + ":delay=" + formatNumber(3.2 + spatialScale * 0.74) + ":phase=" + formatNumber(2.6 + spatialScale * 0.88) + ":softclip=1,"
+        : (ffmpegHasFilter("extrastereo") ? "extrastereo=m=" + formatNumber(1.34 + spatialScale * 0.14) + ":c=0," : "");
+    const double vocalBoost = vocalFocus ? 1.22 : 0.48;
+    const double vocalAirBoost = vocalFocus ? 0.98 : 0.26;
+    const double surroundBoost = (surroundPlus ? 1.34 : (immersive ? 1.08 : 0.92)) * spatialScale;
+    const double rearBoost = (surroundPlus ? 1.45 : (immersive ? 1.20 : 0.92)) * spatialScale;
+    const double sideBoost = (surroundPlus ? 1.36 : (immersive ? 1.24 : 0.96)) * spatialScale;
+    const double airBoost = (surroundPlus ? 1.22 : (immersive ? 0.92 : 0.86)) * spatialScale;
+
+    const std::array<VirtualSpatialSource, 17> sources {{
+        {"main", 0.0, 0.64, 0.0, 0.78 * (vocalFocus ? 0.98 : 1.0), 23, 20500, 0.0, false, false, false},
+        {"vocalcore", 0.0, 0.56, 1.0, 0.12 * vocalBoost, 180, 5000, 0.0, false, false, false},
+        {"vocalair", 0.0, 0.74, 10.0, 0.026 * vocalAirBoost, 3200, 11800, 0.0, false, false, false},
+        {"sub", 0.0, 0.84, -10.0, 0.15, 20, 110, 0.0, false, true, false},
+        {"punch", 0.0, 0.72, -7.0, 0.085, 68, 190, 0.0, false, true, false},
+        {"warm", 0.0, 0.88, -3.0, 0.052, 180, 820, 0.0, false, false, false},
+        {"presence", 0.0, 0.74, 4.0, 0.038 * vocalBoost, 950, 4800, 0.0, false, false, false},
+        {"sparkle", 10.0, 1.00, 18.0, 0.030 * airBoost, 7600, 19000, 0.06, false, false, false},
+        {"air", -18.0, 1.16, 32.0, 0.032 * airBoost, 5600, 20500, 0.10, false, false, true},
+        {"leftnear", -38.0, 0.68, 3.0, 0.072 * sideBoost, 180, 12000, 0.08, false, false, false},
+        {"rightnear", 38.0, 0.68, 3.0, 0.072 * sideBoost, 180, 12000, 0.08, false, false, false},
+        {"leftside", -78.0, 0.88, 0.0, 0.066 * sideBoost, 240, 10800, 0.12, true, false, false},
+        {"rightside", 78.0, 0.88, 0.0, 0.066 * sideBoost, 240, 10800, 0.12, true, false, false},
+        {"leftrear", -122.0, 1.08, -4.0, 0.048 * rearBoost, 340, 8800, 0.14, true, false, true},
+        {"rightrear", 122.0, 1.08, -4.0, 0.048 * rearBoost, 340, 8800, 0.14, true, false, true},
+        {"frontfar", 0.0, 1.00, 8.0, 0.028 * surroundBoost, 240, 9000, 0.0, false, false, false},
+        {"ceiling", 24.0, 1.08, 44.0, 0.020 * airBoost, 6500, 18000, 0.10, false, false, true},
+    }};
+
+    std::ostringstream filter;
+    filter << inputPad << "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+           << "highpass=f=23,lowpass=f=20500,asplit=" << (sources.size() + 1) << "[dryanchor]";
+    for (const auto& source : sources) {
+        filter << '[' << source.name << ']';
+    }
+    filter << ';';
+
+    filter << "[dryanchor]volume=" << formatNumber(dryAnchor, 4) << "[dryanchorout];";
+
+    for (const auto& source : sources) {
+        const bool farOrWide = source.width > 0.30 || std::abs(source.azimuthDegrees) > 80.0 || source.addReflection;
+        filter << makeSpatialSourceFilter(source, farOrWide ? farWidth : nearWidth);
+    }
+
+    filter << "[dryanchorout]";
+    for (const auto& source : sources) {
+        filter << '[' << source.name << "out]";
+    }
+    filter << "amix=inputs=" << (sources.size() + 1) << ":normalize=0,"
+           << "acompressor=threshold=0.92:ratio=1.04:attack=24:release=220:makeup=1.00,"
+           << headphoneGlue
+           << crystal
+           << "alimiter=limit=0.96:attack=3:release=110:level=disabled,"
+           << "aresample=48000:resampler=soxr:precision=33[aout]";
+    return filter.str();
+}
+
+void muxAudioWithFfmpeg(const RenderConfig& config, const std::filesystem::path& videoOnlyPath, const std::filesystem::path& musicPath, const std::filesystem::path& outputPath) {
+    const std::string surroundFilter = makeHifiSurroundFilter("[1:a]", config);
 
     std::ostringstream command;
     command << "ffmpeg -y -hide_banner -loglevel error "
@@ -1351,8 +1666,8 @@ void muxAudioWithFfmpeg(const std::filesystem::path& videoOnlyPath, const std::f
     }
 }
 
-void enhanceSourceVideoAudioOnlyWithFfmpeg(const std::filesystem::path& sourceVideoPath, const std::filesystem::path& outputPath) {
-    const std::string surroundFilter = makeHifiSurroundFilter("[0:a]");
+void enhanceSourceVideoAudioOnlyWithFfmpeg(const RenderConfig& config, const std::filesystem::path& sourceVideoPath, const std::filesystem::path& outputPath) {
+    const std::string surroundFilter = makeHifiSurroundFilter("[0:a]", config);
 
     std::ostringstream command;
     command << "ffmpeg -y -hide_banner -loglevel error "
@@ -1511,7 +1826,7 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
         if (shouldCancel && shouldCancel()) {
             throw std::runtime_error("渲染已由用户取消");
         }
-        enhanceSourceVideoAudioOnlyWithFfmpeg(config.musicPath, config.outputVideoPath);
+        enhanceSourceVideoAudioOnlyWithFfmpeg(config, config.musicPath, config.outputVideoPath);
         if (onProgress) {
             onProgress({1, 1, 1.0, "原视频画面已保留，HiFi 双声道 3D 音轨处理完成"});
         }
@@ -1649,7 +1964,7 @@ void VideoRenderer::render(const RenderConfig& config, const ProgressCallback& o
         throw std::runtime_error("渲染已由用户取消");
     }
 
-    muxAudioWithFfmpeg(videoOnlyPath, config.musicPath, outputPath);
+    muxAudioWithFfmpeg(config, videoOnlyPath, config.musicPath, outputPath);
     std::error_code removeError;
     std::filesystem::remove(videoOnlyPath, removeError);
 
